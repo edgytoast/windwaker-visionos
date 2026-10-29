@@ -35,7 +35,7 @@ Lions does the rest.
 - **Or in 2D, like the original.** The button above the window's corner (or L1 and Create together
   on a gamepad) flattens it back to the GameCube's own picture, and back again.
 - **A controller you already have.** A DualSense, an Xbox pad or any other gamepad, or both PS VR2
-  Sense controllers held as one. The camera turns the modern way by default; the Controls tab has
+  Sense controllers held as one (that pair isn't tried on a headset yet). The camera turns the modern way by default; the Controls tab has
   the GameCube's way round, and inverted up and down.
 - **Saves, as they always were.** Save from the game's own menu; your saves stay on the headset
   between updates.

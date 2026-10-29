@@ -38,7 +38,7 @@ disc.
 - **About 5 GB of free disk space** and the network. The first build takes an hour or two: it builds
   Dawn (the graphics layer) once, then the whole game. Later builds take minutes.
 - **A controller.** The Window view plays with a gamepad (DualSense, Xbox or another), or both PS VR2
-  Sense controllers held as one.
+  Sense controllers held as one (that pair isn't tried on a headset yet).
 
 ## Game files
 
@@ -160,7 +160,7 @@ WindWaker. Copy that folder out to keep your own backup: deleting the app delete
 ## Controls
 
 - **Window:** it plays like the original game, so it needs a gamepad, or both Sense controllers
-  held as one. Look at the game window to give it your controller: visionOS sends a controller's
+  held as one (not yet tried on a headset). Look at the game window to give it your controller: visionOS sends a controller's
   input to the window you're looking at. The [README](README.md#play) has every button. The 2D or 3D
   button sits above the window's corner (L1 and Create together on a gamepad), and the Controls tab
   sets which way the camera turns.
