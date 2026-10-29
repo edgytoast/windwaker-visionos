@@ -1,0 +1,982 @@
+diff --git a/include/aurora/mirror.h b/include/aurora/mirror.h
+index 2d60ec8..d92cf44 100644
+--- a/include/aurora/mirror.h
++++ b/include/aurora/mirror.h
+@@ -96,15 +96,20 @@ struct Frame {
+   uint32_t removedCount;
+ };
+ 
++// The view-scale mark (GXAuroraMirrorMark; GXAurora.h has 1 to 3): how much wider than its picture
++// the frame is drawn (value: the scale), so the tangents reported are the picture's.
++inline constexpr uint32_t MarkViewScale = 4u;
++
+ // Whether to record (any thread). Turning it on starts the textures over: each is sent again.
+ void set_enabled(bool enabled) noexcept;
+ bool enabled() noexcept;
+ 
+ // How far in front of its glass the window showing the frames lets them come out, in window widths
+-// (any thread; 0, the default: no limit), and the narrowest half-view tangent it shows as is (a
+-// narrower view's depths are compressed to the picture seen from that tangent, which the window's
+-// scale of depth has to match). Nearer geometry eases into the allowance from half of it.
+-void set_front_allowance(float widths, float minViewTangent) noexcept;
++// (any thread; 0, the default: no limit), and how far in front of the glass the window puts the
++// camera, in window widths (0: where the view puts it, 1 / (2 tan); further out, depths are scaled
++// so the picture from there is the same, which the window's scale of depth has to match). Nearer
++// geometry eases into the allowance from half of it.
++void set_front_allowance(float widths, float cameraWidths) noexcept;
+ 
+ // The newest recorded frame whose tag is no later than `upTo` (the game frame the caller shows
+ // alongside, so the two match), or false before the first. Its pointers stay valid until the next
+diff --git a/lib/gx/mirror.cpp b/lib/gx/mirror.cpp
+index 3fd0cdb..bb6fe30 100644
+--- a/lib/gx/mirror.cpp
++++ b/lib/gx/mirror.cpp
+@@ -414,6 +414,12 @@ std::atomic_bool g_reset{false};
+ // FIFO thread.
+ bool g_recording = false;
+ int g_offscreen = 0;
++// 0109: how much wider the game draws than the picture the window shows (its view scale mark, right
++// after BEGIN): the frame's view tangents are the picture's, so the window lays the scene out as the
++// 2D picture is framed, and what the wider view adds lies past the picture's edges.
++constexpr u32 kMarkViewScale = ::aurora::mirror::MarkViewScale; // visionos/host/wwvr_window.cpp sends it
++float g_viewScale = 1.f;            // this frame's (FIFO thread)
++long g_frameDraws = 0;              // this frame's draws so far (AURORA_MIRROR_SKIP)
+ bool g_haveProjection = false;
+ float g_p0 = 1, g_p2 = 1;
+ bool g_sawDepthWrite = false;
+@@ -1892,6 +1898,14 @@ struct DrawJob {
+   // a bake of the TEV's whole result (its colour and alpha as they are).
+   float pull = 0.f;
+   bool baked = false;
++  // 0109: a bake_reads bake that also reads the vertex colour: per channel, a constant times each of
++  // the two lit channels' rgba added, or (>= 0) the one that multiplies the bake.
++  bool bakeRaster = false;
++  float bakeAlpha = 1.f; // the bake's alpha times this (a blob shadow's darkness)
++  float bakeUV[2] = {1.f, 1.f}; // the base coordinate's scale onto the bake (1 / its periods: bake_reads)
++  int bakeRaw = -1; // bake_reads: the vertices' own coordinate (TEX0 + n) the bake is laid out in
++  std::array<std::array<float, 8>, 4> bakeAdded{};
++  std::array<int8_t, 4> bakeMultiplied{-1, -1, -1, -1};
+   // 0107: each vertex's colour before its fog, and its fog: a draw whose fog changes much across
+   // a triangle has that triangle split (build_triangles), each new vertex fogged where it is.
+   // GX fogs each pixel by its depth; fogged at the vertices only, a big polygon (the sea's plane,
+@@ -2117,7 +2131,7 @@ float decode_vertex(DrawJob& job, const Decoder& decoder, uint32_t v) {
+   // The lit channels: the TEV's raster colours, and (0104) the source of a texture coordinate made
+   // from a colour channel.
+   F4 raster[2];
+-  if (job.perVertex || plan.colourCoords) {
++  if (job.perVertex || plan.colourCoords || job.bakeRaster) {
+     light(job, colours, view, normal, raster);
+   }
+   // 0104: each lookup read where this vertex's coordinate for it falls.
+@@ -2152,19 +2166,41 @@ float decode_vertex(DrawJob& job, const Decoder& decoder, uint32_t v) {
+     }
+   }
+   if (plan.primary != nullptr || job.baked) {
+-    const auto uv = tex_coord(st, decoder, config, plan.primaryCoord, v, position,
+-                              F3{rawNormal[0], rawNormal[1], rawNormal[2]}, plan.colourCoords ? raster : colours);
+-    out.uv[0] = std::isfinite(uv[0]) ? uv[0] : 0.f;
+-    out.uv[1] = std::isfinite(uv[1]) ? uv[1] : 0.f;
++    auto uv = tex_coord(st, decoder, config, plan.primaryCoord, v, position,
++                        F3{rawNormal[0], rawNormal[1], rawNormal[2]}, plan.colourCoords ? raster : colours);
++    if (job.baked && job.bakeRaw >= 0) {
++      // (0109: bake_reads lays its bake out in the vertices' own coordinate.)
++      float raw[2] = {0.f, 0.f};
++      const auto attr = static_cast<GXAttr>(GX_VA_TEX0 + job.bakeRaw);
++      decoder.numbers(attr, v, std::min<int>(config.attrs[attr].cnt, 2), raw);
++      uv = {raw[0], raw[1]};
++    }
++    out.uv[0] = std::isfinite(uv[0]) ? uv[0] * (job.baked ? job.bakeUV[0] : 1.f) : 0.f;
++    out.uv[1] = std::isfinite(uv[1]) ? uv[1] * (job.baked ? job.bakeUV[1] : 1.f) : 0.f;
+   }
+   DrawJob::Prefog pre{};
+   pre.fog = fog;
+   if (job.baked) {
+-    // 0105: the baked texture is the TEV's whole result; only the fog is per vertex.
++    // 0105: the baked texture is the TEV's whole result; only the fog is per vertex (0109: and the
++    // part of the vertex colour in it, bake_reads).
+     for (int c = 0; c < 4; ++c) {
+       pre.mul[c] = 1.f;
+       pre.add[c] = 0.f;
+     }
++    pre.mul[3] = job.bakeAlpha;
++    if (job.bakeRaster) {
++      const float lit[8] = {raster[0][0], raster[0][1], raster[0][2], raster[0][3],
++                            raster[1][0], raster[1][1], raster[1][2], raster[1][3]};
++      for (int c = 0; c < 4; ++c) {
++        if (job.bakeMultiplied[c] >= 0) {
++          pre.mul[c] = lit[job.bakeMultiplied[c]];
++        } else {
++          for (int j = 0; j < 8; ++j) {
++            pre.add[c] += job.bakeAdded[c][j] * lit[j];
++          }
++        }
++      }
++    }
+     apply_fog(job, pre, out);
+     if (job.fogged) {
+       job.prefog[v] = pre;
+@@ -2972,8 +3008,9 @@ std::atomic<uint32_t> g_lastParts{0};
+ // band, for the periodic log.
+ std::atomic<float> g_lastPlane{0}, g_lastFocus{0}, g_lastBandShare{0};
+ // How far the window lets the scene come out in front of its glass (window widths; 0: as far as it
+-// goes), and the narrowest view it shows as is (set_front_allowance).
+-std::atomic<float> g_frontAllowance{0}, g_minViewTangent{0};
++// goes), and how far in front of it the camera is placed (window widths; 0: where its view puts it,
++// 1 / (2 tan)) (set_front_allowance).
++std::atomic<float> g_frontAllowance{0}, g_cameraWidths{0};
+ std::atomic<float> g_lastAllowance{0}; // the last frame's, the lesser limit (finish)
+ 
+ void finish(Job& job) {
+@@ -3034,7 +3071,8 @@ void finish(Job& job) {
+     const float onPlane = out.plane * 1.0005f, band = 0.03f, bandEnd = onPlane * (1.f + band);
+     // In window widths in front of the glass, at depth d: k (plane - d) (MirrorScene.place); the
+     // camera is k plane in front of it.
+-    const float k = 1.f / (2.f * out.plane * std::max(out.tanHalfX, g_minViewTangent.load(std::memory_order_relaxed)));
++    const float cameraWidths = g_cameraWidths.load(std::memory_order_relaxed);
++    const float k = cameraWidths > 0.f ? cameraWidths / out.plane : 1.f / (2.f * out.plane * out.tanHalfX);
+     const float window = g_frontAllowance.load(std::memory_order_relaxed);
+     const float allowance = std::min(window, 0.9f * k * out.plane * (1.f - 1.f / kClipMargin));
+     // C1 at the knee (it starts at slope 1), then nearing the allowance without reaching it.
+@@ -3200,8 +3238,8 @@ void publish(bool scene, float focus) {
+       g_job.scene = scene;
+       g_job.tag = g_frameTag;
+       g_job.focus = focus;
+-      g_job.tanHalfX = g_haveProjection ? 1.f / g_p0 : 1.f;
+-      g_job.tanHalfY = g_haveProjection ? 1.f / g_p2 : 1.f;
++      g_job.tanHalfX = g_haveProjection ? 1.f / g_p0 / g_viewScale : 1.f;
++      g_job.tanHalfY = g_haveProjection ? 1.f / g_p2 / g_viewScale : 1.f;
+       g_jobPending = true;
+     }
+     // (As in finish: a removal of an earlier frame still waiting here is cancelled by a return.)
+@@ -3251,7 +3289,13 @@ void publish(bool scene, float focus) {
+ bool recording() noexcept { return g_recording; }
+ 
+ void mark(u32 mark, f32 value) noexcept {
++  if (mark == kMarkViewScale) {
++    g_viewScale = std::isfinite(value) ? std::clamp(value, 1.f, 4.f) : 1.f;
++    return;
++  }
+   if (mark == AURORA_MIRROR_MARK_BEGIN) {
++    g_viewScale = 1.f;
++    g_frameDraws = 0;
+     discard_jobs(); // a frame that never ended
+     g_frameTag = static_cast<uint32_t>(std::max(value, 0.f)) & 0xFFFFFFu;
+     g_recording = g_enabled.load(std::memory_order_relaxed);
+@@ -3372,6 +3416,34 @@ bool reads_raster(const ShaderConfig& config) {
+   }
+   return false;
+ }
++// Which colour registers (PREV, REG0..2 as bits 0..3) a draw's TEV stages read.
++uint32_t regs_read(const ShaderConfig& config) {
++  uint32_t used = 0;
++  for (u32 i = 0; i < std::min<u32>(config.tevStageCount, MaxTevStages); ++i) {
++    const TevStage& stage = config.tevStages[i];
++    const auto& c = stage.colorPass;
++    const auto& a = stage.alphaPass;
++    for (const GXTevColorArg arg : {c.a, c.b, c.c, c.d}) {
++      switch (arg) {
++      case GX_CC_CPREV: case GX_CC_APREV: used |= 1u; break;
++      case GX_CC_C0: case GX_CC_A0: used |= 2u; break;
++      case GX_CC_C1: case GX_CC_A1: used |= 4u; break;
++      case GX_CC_C2: case GX_CC_A2: used |= 8u; break;
++      default: break;
++      }
++    }
++    for (const GXTevAlphaArg arg : {a.a, a.b, a.c, a.d}) {
++      switch (arg) {
++      case GX_CA_APREV: used |= 1u; break;
++      case GX_CA_A0: used |= 2u; break;
++      case GX_CA_A1: used |= 4u; break;
++      case GX_CA_A2: used |= 8u; break;
++      default: break;
++      }
++    }
++  }
++  return used;
++}
+ constexpr uint32_t kBakeMaxTexels = 128 * 128;
+ constexpr uint64_t kBakeTexelsPerFrame = 128 * 128 * 12;
+ 
+@@ -3555,6 +3627,700 @@ bool bake_pair(DrawJob& job, MirrorPart& part, bool overHair) {
+   return use(baked.id);
+ }
+ 
++// 0109: the TEV's stages in numbers, every texture known (`texels`: per stage, its sample, before the
++// swap table), no raster colour read: bake_reads' per-texel run (run_tev's symbols cost too much
++// for thousands of texels a frame). Comparison ops are taken as their d, as run_tev takes them.
++std::array<float, 4> tev_numeric(const DrawJob& job, const std::array<std::array<float, 4>, MaxTevStages>& texels,
++                                 const float raster[8]) {
++  const auto& config = job.config;
++  const auto& plan = job.plan;
++  const u32 stageCount = std::min<u32>(config.tevStageCount, MaxTevStages);
++  float regs[MaxTevRegs][4];
++  for (u32 r = 0; r < MaxTevRegs; ++r) {
++    for (int c = 0; c < 4; ++c) {
++      regs[r][c] = job.state.colorRegs[r][c];
++    }
++  }
++  for (u32 s = 0; s < stageCount; ++s) {
++    const TevStage& stage = config.tevStages[s];
++    const auto& swap = config.tevSwapTable[stage.tevSwapTex];
++    float tex[4] = {1.f, 1.f, 1.f, 1.f};
++    if (stage.texMapId != GX_TEXMAP_NULL) {
++      const int from[4] = {swap_channel(swap.red), swap_channel(swap.green), swap_channel(swap.blue), swap_channel(swap.alpha)};
++      for (int c = 0; c < 4; ++c) {
++        tex[c] = texels[s][from[c] & 3];
++      }
++    }
++    // The vertex colour (two channels, rgba each), through the stage's swap table.
++    const auto& rasSwap = config.tevSwapTable[stage.tevSwapRas];
++    const int rasFrom[4] = {swap_channel(rasSwap.red) & 3, swap_channel(rasSwap.green) & 3, swap_channel(rasSwap.blue) & 3,
++                            swap_channel(rasSwap.alpha) & 3};
++    const bool hasRaster = stage.channelId != GX_COLOR_NULL && stage.channelId != GX_COLOR_ZERO && !is_bump_channel(stage.channelId);
++    const int rasBase = hasRaster ? (color_channel(stage.channelId) & 1) * 4 : 0;
++    const auto ras = [&](int c) { return hasRaster ? raster[rasBase + rasFrom[c]] : 0.f; };
++    const auto colour_arg = [&](GXTevColorArg arg, int c) -> float {
++      switch (arg) {
++      case GX_CC_CPREV: return regs[0][c];
++      case GX_CC_APREV: return regs[0][3];
++      case GX_CC_C0: return regs[1][c];
++      case GX_CC_A0: return regs[1][3];
++      case GX_CC_C1: return regs[2][c];
++      case GX_CC_A1: return regs[2][3];
++      case GX_CC_C2: return regs[3][c];
++      case GX_CC_A2: return regs[3][3];
++      case GX_CC_TEXC: return tex[c];
++      case GX_CC_TEXA: return tex[3];
++      case GX_CC_RASC: return ras(c);
++      case GX_CC_RASA: return ras(3);
++      case GX_CC_ONE: return 1.f;
++      case GX_CC_HALF: return 0.5f;
++      case GX_CC_KONST: return plan.konst[s][c];
++      default: return 0.f;
++      }
++    };
++    const auto alpha_arg = [&](GXTevAlphaArg arg) -> float {
++      switch (arg) {
++      case GX_CA_APREV: return regs[0][3];
++      case GX_CA_A0: return regs[1][3];
++      case GX_CA_A1: return regs[2][3];
++      case GX_CA_A2: return regs[3][3];
++      case GX_CA_TEXA: return tex[3];
++      case GX_CA_RASA: return ras(3);
++      case GX_CA_KONST: return plan.konst[s][3];
++      default: return 0.f;
++      }
++    };
++    const auto run = [](const TevOp& op, float a, float b, float c, float d) {
++      float v = d;
++      if (op.op == GX_TEV_ADD || op.op == GX_TEV_SUB) {
++        const float mixed = a + (b - a) * c;
++        v = (op.op == GX_TEV_SUB ? d - mixed : d + mixed) + tev_bias(op.bias);
++        v *= tev_scale(op.scale);
++      }
++      return op.clamp ? std::clamp(v, 0.f, 1.f) : std::clamp(v, -4.f, 4.f);
++    };
++    // Comparisons (shader.cpp's tev_op): R8, GR16 and BGR24 compare the colour inputs A and B (in an
++    // alpha stage too); RGB8 compares each channel's own (A8 in an alpha stage).
++    float ca[3], cb[3];
++    for (int c = 0; c < 3; ++c) {
++      ca[c] = colour_arg(stage.colorPass.a, c);
++      cb[c] = colour_arg(stage.colorPass.b, c);
++    }
++    const auto packed = [](const float* v, int n) {
++      float sum = 0.f, place = 1.f;
++      for (int i = 0; i < n; ++i, place *= 256.f) {
++        sum += std::round(v[i] * 255.f) * place;
++      }
++      return sum;
++    };
++    const auto compared = [&](GXTevOp op, float a, float b, bool& known) {
++      known = true;
++      switch (op) {
++      case GX_TEV_COMP_R8_GT: return packed(ca, 1) > packed(cb, 1);
++      case GX_TEV_COMP_R8_EQ: return packed(ca, 1) == packed(cb, 1);
++      case GX_TEV_COMP_GR16_GT: return packed(ca, 2) > packed(cb, 2);
++      case GX_TEV_COMP_GR16_EQ: return packed(ca, 2) == packed(cb, 2);
++      case GX_TEV_COMP_BGR24_GT: return packed(ca, 3) > packed(cb, 3);
++      case GX_TEV_COMP_BGR24_EQ: return packed(ca, 3) == packed(cb, 3);
++      case GX_TEV_COMP_RGB8_GT: return std::round(a * 255.f) > std::round(b * 255.f);
++      case GX_TEV_COMP_RGB8_EQ: return std::round(a * 255.f) == std::round(b * 255.f);
++      default: known = false; return false;
++      }
++    };
++    const auto evaluate = [&](const TevOp& op, float a, float b, float c, float d) {
++      bool known = false;
++      const bool pass = compared(op.op, a, b, known);
++      if (!known) {
++        return run(op, a, b, c, d);
++      }
++      const float v = d + (pass ? c : 0.f);
++      return op.clamp ? std::clamp(v, 0.f, 1.f) : std::clamp(v, -4.f, 4.f);
++    };
++    float colour[3];
++    for (int c = 0; c < 3; ++c) {
++      colour[c] = evaluate(stage.colorOp, ca[c], cb[c], colour_arg(stage.colorPass.c, c), colour_arg(stage.colorPass.d, c));
++    }
++    const float alpha = evaluate(stage.alphaOp, alpha_arg(stage.alphaPass.a), alpha_arg(stage.alphaPass.b),
++                                 alpha_arg(stage.alphaPass.c), alpha_arg(stage.alphaPass.d));
++    const u32 colourOut = std::min<u32>(stage.colorOp.outReg, MaxTevRegs - 1);
++    for (int c = 0; c < 3; ++c) {
++      regs[colourOut][c] = colour[c];
++    }
++    regs[std::min<u32>(stage.alphaOp.outReg, MaxTevRegs - 1)][3] = alpha;
++  }
++  std::array<float, 4> result{regs[0][0], regs[0][1], regs[0][2], regs[0][3]};
++  if (stageCount > 0) {
++    const TevStage& last = config.tevStages[stageCount - 1];
++    const u32 colourOut = std::min<u32>(last.colorOp.outReg, MaxTevRegs - 1);
++    for (int c = 0; c < 3; ++c) {
++      result[c] = regs[colourOut][c];
++    }
++    result[3] = regs[std::min<u32>(last.alphaOp.outReg, MaxTevRegs - 1)][3];
++  }
++  return result;
++}
++
++// 0109: a draw that reads one texture through two coordinates, both made from the vertices' own by
++// matrices: the horizon's cloud band (its picture and its alpha each read twice, scrolled apart,
++// the alphas multiplied, the pictures screened), and the foam round the islands' shores (a foam
++// texture read two to four times, scrolling apart, the reads multiplied, under a mask).
++// bake_pair takes one texture per map; the second read stood in as its average, and the band came
++// out faint, the foam a broad white band on the water. Here every read is baked into one texture in
++// the coordinates of one of them (the base: read without a matrix, or the kept one's), as fine as
++// the finest read across it, the TEV run in numbers at each texel. A TEV that also reads the
++// vertex colour (a fade towards the open sea) is kept when each channel is the bake plus the vertex
++// colour times a constant, or the bake times one of the vertex colour's channels: that part per
++// vertex. Baked again as the reads scroll apart, each read's offset taken to a quarter texel first;
++// at most 64x64 (it's baked each frame something scrolls), with bake_pair's sharing and budget.
++constexpr uint32_t kBakeReadsMaxTexels = 64 * 64;
++bool bake_reads(DrawJob& job, MirrorPart& part) {
++  DrawPlan& plan = job.plan;
++  const ShaderConfig& config = job.config;
++  static const long s_traceTag = [] {
++    const char* value = std::getenv("AURORA_MIRROR_TRACE_TAG");
++    return value != nullptr ? std::atol(value) : -1L;
++  }();
++  const bool trace = s_traceTag >= 0 && static_cast<long>(g_frameTag) == s_traceTag;
++  const auto refuse = [&](const char* why) {
++    if (trace) {
++      Log.info("mirror bake_reads: refused ({})", why);
++    }
++    return false;
++  };
++  if (plan.primary == nullptr || plan.primary->captured || plan.behindMap >= 0 || plan.anyLookup ||
++      config.numIndStages != 0) {
++    return false;
++  }
++  const u32 stageCount = std::min<u32>(config.tevStageCount, MaxTevStages);
++  struct Read {
++    int map = -1, coord = -1;
++  };
++  std::array<Read, MaxTevStages> reads{};
++  std::array<std::array<float, 6>, MaxTexCoord> maps{};
++  std::array<bool, MaxTexCoord> mapped{};
++  int source = -1;
++  bool twice = false; // some texture read through two coordinates (bound to one map or to two)
++  std::array<const void*, MaxTexCoord> dataOf{};
++  for (u32 i = 0; i < stageCount; ++i) {
++    const TevStage& stage = config.tevStages[i];
++    if (stage.texMapId == GX_TEXMAP_NULL || !samples_texture(stage)) {
++      continue;
++    }
++    if (stage.texMapId >= MaxTextures || stage.texCoordId >= MaxTexCoord) {
++      return false;
++    }
++    const int coord = stage.texCoordId;
++    if (!mapped[coord]) {
++      int from = -1;
++      if (!coord_affine(job, coord, maps[coord], &from) || (source >= 0 && from != source)) {
++        return refuse("a coordinate not an affine map of one source");
++      }
++      source = from;
++      mapped[coord] = true;
++    }
++    const int map = stage.texMapId;
++    const void* data = g_gxState.loadedTextures[map].data;
++    for (int c = 0; c < static_cast<int>(MaxTexCoord); ++c) {
++      twice = twice || (c != coord && dataOf[c] == data && data != nullptr);
++    }
++    if (dataOf[coord] == nullptr) {
++      dataOf[coord] = data;
++    }
++    reads[i] = {map, coord};
++  }
++  if (!twice) {
++    return false;
++  }
++  // The base: the vertices' own coordinate the reads are all made from (each read's map is from it),
++  // over its unit square where a read clamps. (A read's coordinate as the base, scaled, put the clamp
++  // in the wrong place: the foam beside the rocks came out a smear.)
++  if (source < GX_TG_TEX0 || source > GX_TG_TEX7) {
++    return refuse("no source coordinate");
++  }
++  constexpr float i0 = 1.f, i1 = 0.f, i2 = 0.f, i3 = 0.f, i4 = 1.f, i5 = 0.f;
++  // Each read's texture, and its coordinate from the base's (M = read o base^-1), its offsets taken
++  // to a quarter texel; the bake as fine as the finest read across it (texels per base unit).
++  struct Source {
++    const LookupPixels* pixels = nullptr;
++    uint8_t wrapS = 0, wrapT = 0;
++    std::array<float, 6> m{};
++  };
++  std::array<Source, MaxTevStages> sources{};
++  struct Key {
++    uint64_t ids[MaxTevStages];
++    float m[MaxTevStages][6];
++    float konst[MaxTevStages][4];
++    float regs[MaxTevRegs][4];
++    uint64_t tev;
++    uint32_t width, height;
++    uint32_t period[2];
++    uint8_t wraps[MaxTevStages][2];
++  } key;
++  std::memset(&key, 0, sizeof key);
++  const GXTexObj_& primaryObj = g_gxState.loadedTextures[plan.primaryMap];
++  float densityU = 1.f, densityV = 1.f;
++  for (u32 i = 0; i < stageCount; ++i) {
++    if (reads[i].map < 0) {
++      continue;
++    }
++    const GXTexObj_& obj = g_gxState.loadedTextures[reads[i].map];
++    TexEntry* entry = texture_entry(obj);
++    if (entry == nullptr || !entry->ok || entry->captured || obj.width() * obj.height() > kLookupMaxTexels) {
++      return refuse("a texture not readable on the CPU");
++    }
++    Source& src = sources[i];
++    src.pixels = lookup_pixels(*entry, obj);
++    if (src.pixels == nullptr) {
++      return refuse("no pixels");
++    }
++    src.wrapS = static_cast<uint8_t>(obj.wrap_s());
++    src.wrapT = static_cast<uint8_t>(obj.wrap_t());
++    key.wraps[i][0] = src.wrapS;
++    key.wraps[i][1] = src.wrapT;
++    const auto& r = maps[reads[i].coord];
++    src.m = {r[0] * i0 + r[1] * i3, r[0] * i1 + r[1] * i4, r[0] * i2 + r[1] * i5 + r[2],
++             r[3] * i0 + r[4] * i3, r[3] * i1 + r[4] * i4, r[3] * i2 + r[4] * i5 + r[5]};
++    const float w = static_cast<float>(obj.width()), h = static_cast<float>(obj.height());
++    const float qs = 4.f * w, qt = 4.f * h;
++    src.m[2] = std::round(src.m[2] * qs) / qs;
++    src.m[5] = std::round(src.m[5] * qt) / qt;
++    key.ids[i] = entry->id;
++    std::copy(src.m.begin(), src.m.end(), key.m[i]);
++    densityU = std::max({densityU, w * std::fabs(src.m[0]), h * std::fabs(src.m[3])});
++    densityV = std::max({densityV, w * std::fabs(src.m[1]), h * std::fabs(src.m[4])});
++  }
++  // How the result repeats along the base's u and v: a read that wraps round (repeat or mirror) and
++  // moves along an axis makes it repeat there, over the least period (up to 4) its scale makes whole;
++  // reads that clamp, or don't move, don't. The bake spans one period, wraps as the result does, and
++  // the vertices' coordinates are scaled onto it (a foam strip runs many periods along a shore: baked
++  // over the first and clamped, the rest was the first's edge, smeared).
++  int period[2] = {1, 1};
++  bool repeats[2] = {false, false};
++  for (u32 i = 0; i < stageCount; ++i) {
++    if (reads[i].map < 0) {
++      continue;
++    }
++    const Source& src = sources[i];
++    for (int axis = 0; axis < 2; ++axis) {
++      // d(s)/d(axis) and d(t)/d(axis), with s's and t's wraps.
++      const float ds = src.m[axis], dt = src.m[3 + axis];
++      for (const auto& [rate, wrap] : {std::pair<float, uint8_t>{ds, src.wrapS}, std::pair<float, uint8_t>{dt, src.wrapT}}) {
++        if (std::fabs(rate) < 1e-4f || wrap == GX_CLAMP) {
++          continue;
++        }
++        repeats[axis] = true;
++        const float unit = wrap == GX_MIRROR ? 2.f : 1.f; // a mirrored read repeats every two
++        int p = 1;
++        while (p < 4 && std::fabs(rate * static_cast<float>(p) / unit - std::round(rate * static_cast<float>(p) / unit)) > 1e-3f) {
++          ++p;
++        }
++        period[axis] = std::max(period[axis], p);
++      }
++    }
++  }
++  densityU *= static_cast<float>(period[0]);
++  densityV *= static_cast<float>(period[1]);
++  const auto pow2 = [](float density) {
++    uint32_t n = 1;
++    while (static_cast<float>(n) < density - 0.5f && n < 1024) {
++      n *= 2;
++    }
++    return n;
++  };
++  uint32_t width = pow2(densityU), height = pow2(densityV);
++  while (width * height > kBakeReadsMaxTexels) {
++    (width >= height ? width : height) /= 2;
++  }
++  key.width = width;
++  key.height = height;
++  key.period[0] = static_cast<uint32_t>(period[0]);
++  key.period[1] = static_cast<uint32_t>(period[1]);
++  for (u32 i = 0; i < stageCount; ++i) {
++    for (int c = 0; c < 4; ++c) {
++      key.konst[i][c] = plan.konst[i][c];
++    }
++  }
++  const uint32_t regsUsed = regs_read(config);
++  for (u32 r = 0; r < MaxTevRegs; ++r) {
++    for (int c = 0; c < 4 && (regsUsed >> r & 1u) != 0; ++c) {
++      key.regs[r][c] = job.state.colorRegs[r][c];
++    }
++  }
++  key.tev = xxh3_hash_s(config.tevStages.data(), sizeof(TevStage) * stageCount) ^
++            xxh3_hash_s(config.tevSwapTable.data(), sizeof(config.tevSwapTable));
++  // The TEV at a base texel, with the vertex colour (both channels) as given.
++  std::array<std::array<float, 4>, MaxTevStages> samples{};
++  const auto at = [&](float u, float v, const float raster[8]) {
++    for (u32 i = 0; i < stageCount; ++i) {
++      const Source& src = sources[i];
++      if (src.pixels != nullptr) {
++        samples[i] = sample_lookup(*src.pixels, src.m[0] * u + src.m[1] * v + src.m[2],
++                                   src.m[3] * u + src.m[4] * v + src.m[5], src.wrapS, src.wrapT);
++      }
++    }
++    return tev_numeric(job, samples, raster);
++  };
++  // The vertex colour's part, per channel: added (a constant times it) or multiplying the bake.
++  job.bakeRaster = false;
++  const bool raster = reads_raster(config);
++  std::array<std::array<float, 8>, 4> added{};
++  std::array<int8_t, 4> multiplied{-1, -1, -1, -1};
++  if (raster) {
++    constexpr float kNone[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++    std::array<bool, 4> additive{true, true, true, true}, multiplying{true, true, true, true};
++    std::array<int, 4> channel{-1, -1, -1, -1};
++    for (int t = 0; t < 16; ++t) {
++      const float u = (static_cast<float>(t % 4) + 0.37f) / 4.f, v = (static_cast<float>(t / 4) + 0.61f) / 4.f;
++      const auto g = at(u, v, kNone);
++      for (int j = 0; j < 8; ++j) {
++        float unit[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++        unit[j] = 1.f;
++        const auto h = at(u, v, unit);
++        for (int c = 0; c < 4; ++c) {
++          const float d = h[c] - g[c];
++          // Added: the same constant at every texel (where it changes nothing too). Multiplying:
++          // one channel, the bake's own.
++          if (t == 0) {
++            added[c][j] = d;
++          } else if (std::fabs(added[c][j] - d) > 1.f / 255.f) {
++            additive[c] = false;
++          }
++          if (std::fabs(d) < 1e-4f) {
++            continue;
++          }
++          multiplying[c] = multiplying[c] && std::fabs(g[c]) < 1e-4f && (channel[c] < 0 || channel[c] == j);
++          channel[c] = j;
++        }
++      }
++    }
++    for (int c = 0; c < 4; ++c) {
++      if (channel[c] < 0 || additive[c]) {
++        multiplied[c] = -1;
++      } else if (multiplying[c]) {
++        multiplied[c] = static_cast<int8_t>(channel[c]);
++        added[c] = {};
++      } else {
++        return refuse("the vertex colour neither added nor multiplying");
++      }
++    }
++    job.bakeRaster = true;
++    job.bakeAdded = added;
++    job.bakeMultiplied = multiplied;
++    key.tev ^= xxh3_hash_s(multiplied.data(), sizeof multiplied);
++  }
++  const uint64_t keyHash = xxh3_hash_s(&key, sizeof key);
++  const auto use = [&](uint64_t id) {
++    part.texture = id;
++    part.wrapS = repeats[0] ? static_cast<uint8_t>(aurora::mirror::WrapRepeat) : static_cast<uint8_t>(aurora::mirror::WrapClamp);
++    part.wrapT = repeats[1] ? static_cast<uint8_t>(aurora::mirror::WrapRepeat) : static_cast<uint8_t>(aurora::mirror::WrapClamp);
++    job.baked = true;
++    job.bakeRaw = source - GX_TG_TEX0;
++    job.bakeUV[0] = 1.f / static_cast<float>(period[0]);
++    job.bakeUV[1] = 1.f / static_cast<float>(period[1]);
++    if (trace) {
++      Log.info("mirror bake_reads: baked {}x{} over {}x{} periods, {}{}", width, height, period[0], period[1],
++               repeats[0] ? (repeats[1] ? "repeating both ways" : "repeating along u") : (repeats[1] ? "repeating along v" : "clamped"),
++               raster ? " (with the vertex colour)" : "");
++    }
++    return true;
++  };
++  if (const auto made = g_bakeKeys.find(keyHash); made != g_bakeKeys.end()) {
++    return use(made->second);
++  }
++  // A slot per draw of the frame reading these textures, as bake_pair's.
++  const uint64_t ids = xxh3_hash_s(key.ids, sizeof key.ids);
++  const uint64_t slot[2] = {ids, g_bakeOccurrences[ids]++};
++  Baked& baked = g_baked[xxh3_hash_s(slot, sizeof slot)];
++  const uint64_t texels = static_cast<uint64_t>(width) * height;
++  if (baked.key != keyHash && g_bakeTexels + texels > kBakeTexelsPerFrame &&
++      (baked.id == 0 || g_frame - baked.bakedFrame < 3)) {
++    if (baked.id == 0) {
++      job.bakeRaster = false;
++      return refuse("over the frame's budget");
++    }
++    baked.lastFrame = g_frame;
++    return use(baked.id);
++  }
++  if (baked.id == 0) {
++    baked.id = g_nextTextureId++;
++  }
++  baked.lastFrame = g_frame;
++  g_bakeKeys.emplace(keyHash, baked.id);
++  if (baked.key != keyHash) {
++    baked.key = keyHash;
++    baked.bakedFrame = g_frame;
++    g_bakeTexels += texels;
++    ++g_stats.bakes;
++    g_stats.bakeTexels += texels;
++    std::vector<uint8_t> rgba(static_cast<size_t>(width) * height * 4);
++    float none[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++    for (uint32_t y = 0; y < height; ++y) {
++      for (uint32_t x = 0; x < width; ++x) {
++        const float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(width) * static_cast<float>(period[0]);
++        const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(height) * static_cast<float>(period[1]);
++        auto value = at(u, v, none);
++        for (int c = 0; c < 4; ++c) {
++          if (multiplied[c] >= 0) {
++            float unit[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++            unit[multiplied[c]] = 1.f;
++            value[c] = at(u, v, unit)[c];
++          }
++        }
++        uint8_t* out = &rgba[(static_cast<size_t>(y) * width + x) * 4];
++        for (int c = 0; c < 4; ++c) {
++          out[c] = static_cast<uint8_t>(std::lround(std::clamp(value[c], 0.f, 1.f) * 255.f));
++        }
++      }
++    }
++    if (trace) {
++      // Test runs: the bake's pixels, as PPM (colour) and PGM (alpha), in TMPDIR.
++      if (const char* tmp = std::getenv("TMPDIR"); tmp != nullptr) {
++        const std::string name = fmt::format("{}/mirror-bake-{}-{}x{}", tmp, baked.id, width, height);
++        if (FILE* f = std::fopen((name + ".ppm").c_str(), "wb")) {
++          std::fprintf(f, "P6 %u %u 255\n", width, height);
++          for (size_t i = 0; i < rgba.size(); i += 4) {
++            std::fwrite(&rgba[i], 1, 3, f);
++          }
++          std::fclose(f);
++        }
++        if (FILE* f = std::fopen((name + ".pgm").c_str(), "wb")) {
++          std::fprintf(f, "P5 %u %u 255\n", width, height);
++          for (size_t i = 3; i < rgba.size(); i += 4) {
++            std::fwrite(&rgba[i], 1, 1, f);
++          }
++          std::fclose(f);
++        }
++        Log.info("mirror bake_reads: wrote {}", name);
++      }
++    }
++    const bool cutout = binary_alpha(rgba);
++    g_newTextures.push_back({baked.id, std::move(rgba), width, height, false, cutout});
++  }
++  return use(baked.id);
++}
++
++// 0109: Wind Waker's blob shadows (dDlst_shadowSimple_c: rupees, rocks, pots, the children and
++// other small things) are drawn in the framebuffer's alpha and then by it: a volume (the alpha set to
++// the shadow's darkness where it meets the ground), the blob's shape from a texture (the alpha
++// multiplied by it: an alpha-only draw), then a quad in the shadow's colour blended by that alpha,
++// without a depth test. The mirror left out the alpha-only draws and took the quad as an eye over
++// the hair (0105: blended by its own alpha, which is constant): a solid black square under each.
++// Now the shape's draw is kept aside (AURORA_MIRROR_BLOB_SHADOWS=0: not), and the quad that follows
++// it draws it instead: its texture's alpha as the TEV takes it (baked: a step at the blob's edge),
++// times the darkness the alpha was set to (the last alpha-only draw without a texture that set it),
++// in the quad's colour, lying on the ground as a decal. A quad blended by an alpha the mirror
++// doesn't follow (no shape before it) is left out: nothing, rather than a black square.
++const bool kBlobShadows = switch_on("AURORA_MIRROR_BLOB_SHADOWS");
++std::unique_ptr<DrawJob> g_mask;      // the last blob shape (FIFO thread)
++uint64_t g_maskDraw = UINT64_MAX;     // which draw it was (g_stats.draws)
++float g_lastAlphaSet = 0.f;           // the alpha the last alpha-only draw without a texture set
++std::unique_ptr<DrawJob> g_scratch;   // for working out a draw's TEV
++
++bool samples_any(const ShaderConfig& config) {
++  for (u32 i = 0; i < config.tevStageCount; ++i) {
++    if (samples_texture(config.tevStages[i])) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// A draw's TEV result with no texture and no vertex colour: constants (false if it isn't).
++bool constant_tev(DrawJob& job, const ShaderConfig& config, std::array<float, 4>& out) {
++  if (samples_any(config) || config.attrs[GX_VA_CLR0].attrType != GX_NONE ||
++      config.attrs[GX_VA_CLR1].attrType != GX_NONE) {
++    return false;
++  }
++  job.plan = DrawPlan{};
++  plan_draw(config, job.plan, false);
++  job.state.capture(config);
++  job.config = config;
++  const F4 none[2];
++  F4 raster[2];
++  light(job, none, F3{}, F3{1, 0, 0}, raster);
++  const auto tev = run_tev(job, raster);
++  for (int c = 0; c < 4; ++c) {
++    if (tev[c].sel >= 0 || tev[c].bsel >= 0) {
++      return false;
++    }
++    out[c] = std::clamp(tev[c].c, 0.f, 1.f);
++  }
++  return true;
++}
++
++// An alpha-only draw: a blob's shape kept aside, or the alpha a shadow's volume sets noted.
++void note_alpha_draw(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8* vertices, const u16* indices,
++                     u32 indexCount) {
++  const auto& st = g_gxState;
++  if (!g_scratch) {
++    g_scratch = std::make_unique<DrawJob>();
++  }
++  if (!samples_any(config)) {
++    std::array<float, 4> tev{};
++    const bool sets = st.blendMode == GX_BM_NONE ||
++                      (st.blendMode == GX_BM_BLEND && st.blendFacSrc == GX_BL_ONE && st.blendFacDst == GX_BL_ZERO);
++    if (sets && constant_tev(*g_scratch, config, tev)) {
++      g_lastAlphaSet = st.dstAlpha != UINT32_MAX ? static_cast<float>(st.dstAlpha & 0xFF) / 255.f : tev[3];
++    }
++    return;
++  }
++  // The shape: its alpha multiplies the one there (src dst-alpha, dst zero).
++  if (st.blendMode != GX_BM_BLEND || st.blendFacSrc != GX_BL_DSTALPHA || st.blendFacDst != GX_BL_ZERO) {
++    return;
++  }
++  if (!g_mask) {
++    g_mask = std::make_unique<DrawJob>();
++  }
++  DrawJob& job = *g_mask;
++  job.plan = DrawPlan{};
++  plan_draw(config, job.plan, true);
++  if (job.plan.primary == nullptr || job.plan.primary->captured) {
++    return;
++  }
++  job.state.capture(config);
++  job.config = config;
++  job.prim = prim;
++  job.vtxCount = vtxCount;
++  job.bytes.assign(vertices, vertices + static_cast<size_t>(vtxCount) * config.vtxStride);
++  if (indices != nullptr) {
++    job.indices.assign(indices, indices + indexCount);
++  } else {
++    job.indices.clear();
++  }
++  job.segments.clear();
++  g_maskDraw = g_stats.draws;
++}
++
++// The quad blended by the alpha a blob's shape set up: the shape drawn instead (see above). False if
++// there's no shape just before it (the caller leaves the quad out).
++bool draw_blob_shadow(const ShaderConfig& config, const MirrorPart& quad) {
++  if (!g_mask || g_maskDraw + 1 != g_stats.draws) {
++    return false;
++  }
++  g_maskDraw = UINT64_MAX;
++  std::array<float, 4> colour{};
++  if (!g_scratch) {
++    g_scratch = std::make_unique<DrawJob>();
++  }
++  if (!constant_tev(*g_scratch, config, colour)) {
++    return false;
++  }
++  DrawJob& mask = *g_mask;
++  DrawPlan& plan = mask.plan;
++  const GXTexObj_& obj = g_gxState.loadedTextures[plan.primaryMap];
++  const LookupPixels* pixels = lookup_pixels(*plan.primary, obj);
++  if (pixels == nullptr || plan.primaryCoord < 0) {
++    return false;
++  }
++  // The shape's alpha as its TEV takes it, at each texel; in the quad's colour.
++  struct Key {
++    uint64_t texture, tev;
++    float konst[MaxTevStages][4], regs[MaxTevRegs][4], colour[3];
++  } key;
++  std::memset(&key, 0, sizeof key);
++  key.texture = plan.primary->id;
++  const u32 stageCount = std::min<u32>(mask.config.tevStageCount, MaxTevStages);
++  key.tev = xxh3_hash_s(mask.config.tevStages.data(), sizeof(TevStage) * stageCount) ^
++            xxh3_hash_s(mask.config.tevSwapTable.data(), sizeof(mask.config.tevSwapTable));
++  for (u32 i = 0; i < stageCount; ++i) {
++    for (int c = 0; c < 4; ++c) {
++      key.konst[i][c] = plan.konst[i][c];
++    }
++  }
++  // Only the registers its stages read: each shadow's own darkness (REG0's alpha, from its height)
++  // isn't, and keyed, made a bake per height.
++  const uint32_t regsUsed = regs_read(mask.config);
++  for (u32 r = 0; r < MaxTevRegs; ++r) {
++    for (int c = 0; c < 4 && (regsUsed >> r & 1u) != 0; ++c) {
++      key.regs[r][c] = mask.state.colorRegs[r][c];
++    }
++  }
++  std::copy(colour.begin(), colour.begin() + 3, key.colour);
++  const uint64_t keyHash = xxh3_hash_s(&key, sizeof key);
++  uint64_t id = 0;
++  if (const auto made = g_bakeKeys.find(keyHash); made != g_bakeKeys.end()) {
++    id = made->second;
++  } else {
++    Baked& baked = g_baked[keyHash ^ 0x5348414457ull]; // one per shape and colour
++    if (baked.id == 0) {
++      baked.id = g_nextTextureId++;
++    }
++    baked.lastFrame = g_frame;
++    if (baked.key != keyHash) {
++      baked.key = keyHash;
++      baked.bakedFrame = g_frame;
++      std::vector<uint8_t> rgba(static_cast<size_t>(pixels->width) * pixels->height * 4);
++      std::array<std::array<float, 4>, MaxTevStages> samples{};
++      constexpr float kNone[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++      for (uint32_t texel = 0; texel < pixels->width * pixels->height; ++texel) {
++        const uint8_t* own = &pixels->rgba[static_cast<size_t>(texel) * 4];
++        for (u32 i = 0; i < stageCount; ++i) {
++          for (int c = 0; c < 4; ++c) {
++            samples[i][c] = own[c] / 255.f;
++          }
++        }
++        const auto value = tev_numeric(mask, samples, kNone);
++        uint8_t* out = &rgba[static_cast<size_t>(texel) * 4];
++        for (int c = 0; c < 3; ++c) {
++          out[c] = static_cast<uint8_t>(std::lround(colour[c] * 255.f));
++        }
++        out[3] = static_cast<uint8_t>(std::lround(std::clamp(value[3], 0.f, 1.f) * 255.f));
++      }
++      const bool cutout = binary_alpha(rgba);
++      g_newTextures.push_back({baked.id, std::move(rgba), pixels->width, pixels->height, false, cutout});
++      ++g_stats.bakes;
++    }
++    id = baked.id;
++    g_bakeKeys.emplace(keyHash, id);
++  }
++  // Into the frame, in the quad's place: an alpha blend, on the ground. Black at opacity a darkens a
++  // GX picture to (1 - a) of it, which in linear light is about (1 - a)^2.2 (as 0107's shadows).
++  if (g_jobCount == g_jobs.size()) {
++    g_jobs.push_back(std::make_unique<DrawJob>());
++  }
++  std::swap(g_jobs[g_jobCount], g_mask);
++  DrawJob& job = *g_jobs[g_jobCount++];
++  MirrorPart part{};
++  part.kind = aurora::mirror::PartBlend;
++  part.colourBase = 0.f;
++  part.colourAlpha = 1.f;
++  part.opacityBase = 0.f;
++  part.opacityAlpha = 1.f;
++  part.opacityLuma = 0.f;
++  part.flags = aurora::mirror::PartDepthTest;
++  part.texture = id;
++  part.wrapS = static_cast<uint8_t>(std::min<int>(obj.wrap_s(), 2));
++  part.wrapT = static_cast<uint8_t>(std::min<int>(obj.wrap_t(), 2));
++  (void)quad;
++  job.behind = false;
++  job.background = false;
++  const auto& proj = job.state.proj;
++  const float far = std::fabs(proj.m2[2]) > 1e-9f ? proj.m2[3] / proj.m2[2] : 1e6f;
++  job.nearClip = std::max(1.f, std::fabs(1.f - proj.m2[2]) > 1e-9f ? -proj.m2[2] * far / (1.f - proj.m2[2]) : 1.f);
++  job.kx = kClipMargin / proj.m0[0];
++  job.ky = kClipMargin / proj.m1[1];
++  job.perVertex = false;
++  job.pull = 0.f;
++  job.baked = true;
++  job.bakeRaster = false;
++  job.bakeUV[0] = job.bakeUV[1] = 1.f; // a recycled job: bake_reads' fields from its last use
++  job.bakeRaw = -1;
++  const float darkness = std::clamp(g_lastAlphaSet, 0.f, 1.f);
++  job.bakeAlpha = 1.f - std::pow(1.f - darkness, 2.2f);
++  job.channelSel = {0, 1, 2, 3};
++  Group& group = group_for(part);
++  job.group = static_cast<size_t>(&group - g_groups.data());
++  job.nearer = 1.f - 1e-6f * static_cast<float>(g_jobCount);
++  job.decal = true;
++  queue_open_job();
++  g_openJob = &job;
++  g_mergeTarget = nullptr;
++  g_lastLeftOut = true; // (draws merged into the quad aren't the shape's)
++  ++g_stats.recorded;
++  g_stats.vertices += job.vtxCount;
++  return true;
++}
++
+ // 0108 test switch: AURORA_MIRROR_TRACE_TAG=<game frame> logs every draw of the game's frame n (the
+ // BEGIN mark's number, as the window and the perf lines count; merged ones aside) with its whole
+ // state: blend, depth, colour and alpha writes, the destination alpha, the TEV's stages, registers
+@@ -3660,6 +4426,24 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+   if (s_traceTag >= 0 && static_cast<long>(g_frameTag) == s_traceTag && !merged) {
+     trace_draw(prim, config, vtxCount);
+   }
++  // 0109 test switch: AURORA_MIRROR_SKIP=<first>-<last> leaves out the frame's draws with those
++  // numbers (as AURORA_MIRROR_TRACE_TAG's lines count them): which draws make something.
++  static const std::pair<long, long> s_skip = [] {
++    const char* value = std::getenv("AURORA_MIRROR_SKIP");
++    long first = -1, last = -1;
++    if (value != nullptr && std::sscanf(value, "%ld-%ld", &first, &last) != 2) {
++      first = last = -1;
++    }
++    return std::pair<long, long>{first, last};
++  }();
++  if (!merged) {
++    ++g_frameDraws;
++  }
++  if (s_skip.first >= 0 && g_frameDraws - 1 >= s_skip.first && g_frameDraws - 1 <= s_skip.second) {
++    g_mergeTarget = nullptr;
++    g_lastLeftOut = true;
++    return;
++  }
+   // 0107 test switch: AURORA_MIRROR_TRACE_FRAME=<n> logs every draw of mirror frame n (merged ones
+   // aside), recorded or not, with its state: what the scene is made of, and what the mirror skips.
+   static const long s_traceFrame = [] {
+@@ -3737,6 +4521,9 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+     return;
+   }
+   if (!st.colorUpdate) {
++    if (kBlobShadows && st.alphaUpdate) {
++      note_alpha_draw(prim, config, vtxCount, vertices, indices, indexCount);
++    }
+     ++g_stats.noColour;
+     tally(TallyNoColour);
+     return;
+@@ -3779,6 +4566,14 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+   const bool dstAlphaBlend = st.blendMode == GX_BM_BLEND && st.blendFacSrc == GX_BL_DSTALPHA &&
+                              st.blendFacDst == GX_BL_INVDSTALPHA;
+   const bool dstAlphaDepthTest = st.depthCompare && st.depthFunc != GX_ALWAYS;
++  // 0109: a quad blended by the alpha a blob shadow's shape set up (no texture of its own): the
++  // shadow, drawn from its shape; or, with no shape before it, left out.
++  if (kBlobShadows && dstAlphaBlend && !samples_any(config)) {
++    if (!draw_blob_shadow(config, part)) {
++      tally(TallyBlend);
++    }
++    return;
++  }
+   const bool overHair = kOverHair && dstAlphaBlend && !dstAlphaDepthTest;
+   const bool realShadow = kRealShadows && dstAlphaBlend && dstAlphaDepthTest;
+   if (overHair || realShadow) {
+@@ -3901,6 +4696,10 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+                   plan.anyLookup;
+   job.pull = overHair ? kOverHairPull : 0.f;
+   job.baked = false;
++  job.bakeRaster = false;
++  job.bakeAlpha = 1.f;
++  job.bakeUV[0] = job.bakeUV[1] = 1.f;
++  job.bakeRaw = -1;
+   for (int c = 0; c < 2; ++c) {
+     job.perVertex = job.perVertex || (plan.rasterUsed[c] && (st.colorChannelConfig[c].lightingEnabled ||
+                                                              st.colorChannelConfig[c + GX_ALPHA0].lightingEnabled));
+@@ -3925,7 +4724,7 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+     job.channelSel[3] = -1; // alpha carries the opacity
+   }
+   // 0105: an eye's two textures, baked into one (0108: any draw's two, AURORA_MIRROR_BAKE=0 aside).
+-  if ((overHair || kBakePairs) && bake_pair(job, part, overHair)) {
++  if ((overHair || kBakePairs) && (bake_pair(job, part, overHair) || (kBakePairs && bake_reads(job, part)))) {
+     for (int c = 0; c < 4; ++c) {
+       job.channelSel[c] = static_cast<int8_t>(c);
+     }
+@@ -4028,9 +4827,9 @@ void set_enabled(bool enabled) noexcept {
+ 
+ bool enabled() noexcept { return gx::mirror::g_enabled.load(); }
+ 
+-void set_front_allowance(float widths, float minViewTangent) noexcept {
++void set_front_allowance(float widths, float cameraWidths) noexcept {
+   gx::mirror::g_frontAllowance = std::isfinite(widths) ? std::max(widths, 0.f) : 0.f;
+-  gx::mirror::g_minViewTangent = std::isfinite(minViewTangent) ? std::max(minViewTangent, 0.f) : 0.f;
++  gx::mirror::g_cameraWidths = std::isfinite(cameraWidths) ? std::max(cameraWidths, 0.f) : 0.f;
+ }
+ 
+ bool acquire(Frame& frame, uint32_t upTo) noexcept {

@@ -1,0 +1,381 @@
+diff --git a/cmake/AuroraSDL3Provider.cmake b/cmake/AuroraSDL3Provider.cmake
+index 0f148b0..648e3bd 100644
+--- a/cmake/AuroraSDL3Provider.cmake
++++ b/cmake/AuroraSDL3Provider.cmake
+@@ -148,6 +148,9 @@ elseif (_aurora_sdl3_provider STREQUAL "vendor")
+       COMMAND ${CMAKE_COMMAND}
+         -DSDL_SOURCE_DIR=<SOURCE_DIR>
+         -P "${CMAKE_CURRENT_LIST_DIR}/patches/apply-sdl3-android-security-exception.cmake"
++      COMMAND ${CMAKE_COMMAND}
++        -DSDL_SOURCE_DIR=<SOURCE_DIR>
++        -P "${CMAKE_CURRENT_LIST_DIR}/patches/apply-sdl3-visionos-virtual-joystick.cmake"
+       EXCLUDE_FROM_ALL
+     )
+     FetchContent_MakeAvailable(SDL)
+diff --git a/cmake/patches/apply-sdl3-visionos-virtual-joystick.cmake b/cmake/patches/apply-sdl3-visionos-virtual-joystick.cmake
+new file mode 100644
+index 0000000..3511870
+--- /dev/null
++++ b/cmake/patches/apply-sdl3-visionos-virtual-joystick.cmake
+@@ -0,0 +1,27 @@
++# Apple Vision Pro: SDL gates its virtual-joystick driver behind HIDAPI, which
++# visionOS does not have, so the driver disappears there with it. The driver
++# itself uses no HIDAPI, and the VR menu gamepad (dusk::vr, vr_menu_gamepad.hpp)
++# attaches one, so keep it on visionOS.
++if (NOT DEFINED SDL_SOURCE_DIR)
++  message(FATAL_ERROR "SDL_SOURCE_DIR is required")
++endif ()
++
++set(_cmakelists "${SDL_SOURCE_DIR}/CMakeLists.txt")
++file(READ "${_cmakelists}" _source)
++set(_old [==[dep_option(SDL_VIRTUAL_JOYSTICK    "Enable the virtual-joystick driver" ON SDL_HIDAPI OFF)]==])
++set(_new [==[dep_option(SDL_VIRTUAL_JOYSTICK    "Enable the virtual-joystick driver" ON "SDL_HIDAPI OR VISIONOS" OFF)]==])
++
++string(FIND "${_source}" "${_new}" _already_patched)
++if (NOT _already_patched EQUAL -1)
++  message(STATUS "SDL3 visionOS virtual-joystick patch already applied")
++  return()
++endif ()
++
++string(FIND "${_source}" "${_old}" _patch_site)
++if (_patch_site EQUAL -1)
++  message(FATAL_ERROR "Failed to apply SDL3 visionOS virtual-joystick patch: expected dep_option not found")
++endif ()
++
++string(REPLACE "${_old}" "${_new}" _patched_source "${_source}")
++file(WRITE "${_cmakelists}" "${_patched_source}")
++message(STATUS "Applied SDL3 visionOS virtual-joystick patch")
+diff --git a/include/aurora/aurora.h b/include/aurora/aurora.h
+index 10f64cc..09c6ba0 100644
+--- a/include/aurora/aurora.h
++++ b/include/aurora/aurora.h
+@@ -141,6 +141,10 @@ void aurora_end_frame();
+ 
+ void aurora_set_log_level(AuroraLogLevel level);
+ void aurora_set_pause_on_focus_lost(bool value);
++/** Holds the game clock still while true, on top of aurora's own window and
++ * background pauses: for a host that knows the game isn't being seen (a VR
++ * session that lost focus, a headset taken off). */
++void aurora_set_external_pause(bool paused);
+ void aurora_set_background_input(bool value);
+ void aurora_set_resampler(AuroraSampler sampler);
+ /** Sets the clock timescale. Default 1.0f. 0.0f is paused. Range 0.0f-16.0f. */
+diff --git a/include/aurora/gfx.hpp b/include/aurora/gfx.hpp
+index 45b723d..eca597f 100644
+--- a/include/aurora/gfx.hpp
++++ b/include/aurora/gfx.hpp
+@@ -188,6 +188,13 @@ bool create_pass(uint32_t width, uint32_t height);
+ /// True while an offscreen pass (create_pass or GXCreateFrameBuffer) is open.
+ bool is_offscreen() noexcept;
+ 
++/// Suppresses acquiring/presenting the OS window surface at end_frame() (the frame's GPU work is
++/// still submitted). For a host whose window nobody sees: Apple Vision Pro's window mode and VR
++/// session, where the frames reach the display another way (from TPVR's aurora-vr). Read by the
++/// render worker at end_frame; takes effect from the next frame boundary.
++void set_surface_present_suppressed(bool suppressed) noexcept;
++bool surface_present_suppressed() noexcept;
++
+ /// Increments on aurora_end_frame.
+ uint32_t current_frame() noexcept;
+ 
+diff --git a/lib/aurora.cpp b/lib/aurora.cpp
+index 5e7623b..360ece5 100644
+--- a/lib/aurora.cpp
++++ b/lib/aurora.cpp
+@@ -24,6 +24,7 @@
+ #include "internal.hpp"
+ #include "thread.hpp"
+ #include "window.hpp"
++#include "time_internal.hpp"
+ 
+ #include <SDL3/SDL_filesystem.h>
+ #include <magic_enum.hpp>
+@@ -293,9 +294,12 @@ void end_frame() noexcept {
+     wgpu::Texture currentTexture;
+     wgpu::TextureView currentView;
+     auto surfaceStatus = wgpu::SurfaceGetCurrentTextureStatus::Error;
++    // See gfx::set_surface_present_suppressed(): while set, neither acquire nor present the window
++    // surface this frame. Frame submission itself is unaffected.
++    const bool presentSuppressed = gfx::surface_present_suppressed();
+     {
+       window::SurfaceLock surfaceLock;
+-      if (window::is_presentable() && g_surface) {
++      if (!presentSuppressed && window::is_presentable() && g_surface) {
+         ZoneScopedN("Acquire texture");
+         wgpu::SurfaceTexture surfaceTexture;
+         g_surface.GetCurrentTexture(&surfaceTexture);
+@@ -391,7 +395,7 @@ void end_frame() noexcept {
+         Log.warn("Surface present failed");
+         webgpu::release_surface();
+       }
+-    } else if (g_surface) {
++    } else if (g_surface && !presentSuppressed) {
+       switch (surfaceStatus) {
+       case wgpu::SurfaceGetCurrentTextureStatus::Timeout:
+         Log.warn("Surface texture acquisition timed out");
+@@ -465,6 +469,9 @@ const AuroraBackend* aurora_get_available_backends(size_t* count) {
+ }
+ void aurora_set_log_level(AuroraLogLevel level) { aurora::g_config.logLevel = level; }
+ void aurora_set_pause_on_focus_lost(bool value) { aurora::g_config.pauseOnFocusLost = value; }
++void aurora_set_external_pause(bool paused) {
++  aurora::time::internal::set_pause_reason(aurora::time::internal::PauseReason::External, paused);
++}
+ void aurora_set_background_input(bool value) {
+   aurora::g_config.allowJoystickBackgroundEvents = value;
+   aurora::window::set_background_input(value);
+diff --git a/lib/dawn/MetalBinding.mm b/lib/dawn/MetalBinding.mm
+index df01ed3..9ae5fd6 100644
+--- a/lib/dawn/MetalBinding.mm
++++ b/lib/dawn/MetalBinding.mm
+@@ -3,6 +3,13 @@
+ #import <Foundation/Foundation.h>
+ #include <SDL3/SDL_metal.h>
+ #include <SDL3/SDL_properties.h>
++#include <TargetConditionals.h>
++
++#if TARGET_OS_VISION
++#import <Metal/Metal.h>
++#import <QuartzCore/CAMetalLayer.h>
++#include <SDL3/SDL_video.h>
++#endif
+ 
+ namespace aurora::webgpu::utils {
+ namespace {
+@@ -16,6 +23,29 @@ void SDLCALL destroy_metal_view(void*, void* value) {
+ } // namespace
+ 
+ std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptorCocoa(SDL_Window* window) {
++#if TARGET_OS_VISION
++  // Apple Vision Pro: SDL runs on its offscreen video driver (lib/window.cpp),
++  // so there is no UIKit view to hang a Metal layer on, and nothing shows the
++  // flat image anyway: CompositorServices owns the display and the eyes reach
++  // it through the OpenXR swapchain. Dawn still wants a CAMetalLayer for its
++  // surface, so it gets one that belongs to no view. One layer per process: a
++  // surface rebuild reconfigures it rather than leaking a new one.
++  static CAMetalLayer* layer = nil;
++  if (layer == nil) {
++    layer = [CAMetalLayer layer];
++    layer.device = MTLCreateSystemDefaultDevice();
++    layer.framebufferOnly = NO;
++    layer.opaque = YES;
++  }
++  int width = 0;
++  int height = 0;
++  if (window != nullptr && SDL_GetWindowSizeInPixels(window, &width, &height) && width > 0 && height > 0) {
++    layer.drawableSize = CGSizeMake(width, height);
++  }
++  std::shared_ptr<wgpu::SurfaceSourceMetalLayer> visionDesc = std::make_shared<wgpu::SurfaceSourceMetalLayer>();
++  visionDesc->layer = (__bridge void*)layer;
++  return std::move(visionDesc);
++#endif
+   const auto properties = SDL_GetWindowProperties(window);
+   auto view = static_cast<SDL_MetalView>(SDL_GetPointerProperty(properties, MetalViewProperty, nullptr));
+   if (view == nullptr) {
+diff --git a/lib/device.cpp b/lib/device.cpp
+index b1a0d8b..eb9be84 100644
+--- a/lib/device.cpp
++++ b/lib/device.cpp
+@@ -198,7 +198,8 @@ void shutdown_rumble() noexcept {
+   }
+ }
+ } // namespace detail
+-#elif !defined(SDL_PLATFORM_IOS) || defined(SDL_PLATFORM_TVOS)
++#elif !defined(SDL_PLATFORM_IOS) || defined(SDL_PLATFORM_TVOS) || defined(SDL_PLATFORM_VISIONOS)
++// (Apple Vision Pro has no device haptics; controllers rumble through SDL.)
+ bool rumble_available() noexcept { return false; }
+ 
+ void rumble(const uint16_t lowFreq, const uint16_t highFreq, const uint16_t durationMs) noexcept {
+diff --git a/lib/gfx/recording.cpp b/lib/gfx/recording.cpp
+index cc5d35f..581106c 100644
+--- a/lib/gfx/recording.cpp
++++ b/lib/gfx/recording.cpp
+@@ -1,5 +1,7 @@
+ #include "recording.hpp"
+ 
++#include <atomic>
++
+ #include "encoding.hpp"
+ #include "frame.hpp"
+ #include "resource_cache.hpp"
+@@ -945,6 +947,13 @@ void queue_palette_conv(tex_palette_conv::ConvRequest req) {
+ 
+ bool is_offscreen() noexcept { return g_recorder.inOffscreen; }
+ 
++// See gfx.hpp. Atomic: written on the game thread, read on the render worker at end_frame.
++static std::atomic<bool> g_surfacePresentSuppressed{false};
++void set_surface_present_suppressed(bool suppressed) noexcept {
++  g_surfacePresentSuppressed.store(suppressed, std::memory_order_relaxed);
++}
++bool surface_present_suppressed() noexcept { return g_surfacePresentSuppressed.load(std::memory_order_relaxed); }
++
+ bool has_normal_attachment() noexcept {
+   CHECK(g_recorder.currentRenderPass != UINT32_MAX, "has_normal_attachment called outside of a frame");
+   const auto& pass = current_render_passes()[g_recorder.currentRenderPass];
+diff --git a/lib/main.cpp b/lib/main.cpp
+index 8a7fbee..151e821 100644
+--- a/lib/main.cpp
++++ b/lib/main.cpp
+@@ -1,6 +1,17 @@
+ #include <aurora/main.h>
+ #undef main
+ 
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#endif
++
++#if defined(__APPLE__) && TARGET_OS_VISION
++// Apple Vision Pro: main() belongs to the SwiftUI app around the game. The
++// game's host bridge calls aurora_main() on a thread of its own, after
++// SDL_SetMainReady(), once the immersive space exists; SDL_main.h would
++// otherwise bring SDL's own main(), which starts a UIApplication.
++#else
+ #include <SDL3/SDL_main.h>
+ 
+ int main(int argc, char** argv) { return aurora_main(argc, argv); }
++#endif
+diff --git a/lib/time_internal.hpp b/lib/time_internal.hpp
+index 4fe623d..fc50d99 100644
+--- a/lib/time_internal.hpp
++++ b/lib/time_internal.hpp
+@@ -10,6 +10,7 @@ enum class PauseReason : uint32_t {
+   Window = 1u << 0,
+   Surface = 1u << 1,
+   Background = 1u << 2,
++  External = 1u << 3,
+ };
+ 
+ void set_pause_reason(PauseReason reason, bool paused) noexcept;
+diff --git a/lib/webgpu/gpu.cpp b/lib/webgpu/gpu.cpp
+index b3ae6cd..5e9e113 100644
+--- a/lib/webgpu/gpu.cpp
++++ b/lib/webgpu/gpu.cpp
+@@ -1,3 +1,6 @@
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#endif
+ #include "gpu.hpp"
+ 
+ #include <algorithm>
+@@ -70,6 +73,7 @@ bool g_dualSourceBlendingSupported = false;
+ bool g_bcTexturesSupported = false;
+ bool g_astcTexturesSupported = false;
+ bool g_textureComponentSwizzleSupported = false;
++bool g_metalSharedImageSupported = false;
+ static std::atomic_bool g_initialized = false;
+ static std::atomic_bool g_vsyncEnabled = true;
+ 
+@@ -951,6 +955,25 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
+       }
+ #endif
+     }
++#if defined(__APPLE__) && TARGET_OS_VISION
++    // Apple Vision Pro: the OpenXR provider (visionos/openxr-provider) owns the swapchain images as
++    // IOSurfaces and orders the compositor's reads against Dawn's writes with MTLSharedEvents, and
++    // the window mode hands its frames to RealityKit in IOSurfaces too, so both features must be
++    // requested at device creation.
++    {
++      const bool ioSurface = g_adapter.HasFeature(wgpu::FeatureName::SharedTextureMemoryIOSurface);
++      const bool sharedEvent = g_adapter.HasFeature(wgpu::FeatureName::SharedFenceMTLSharedEvent);
++      if (ioSurface) {
++        requiredFeatures.push_back(wgpu::FeatureName::SharedTextureMemoryIOSurface);
++      }
++      if (sharedEvent) {
++        requiredFeatures.push_back(wgpu::FeatureName::SharedFenceMTLSharedEvent);
++      }
++      g_metalSharedImageSupported = ioSurface && sharedEvent;
++      Log.info("visionOS shared-image support: SharedTextureMemoryIOSurface={} SharedFenceMTLSharedEvent={} -> {}",
++               ioSurface, sharedEvent, g_metalSharedImageSupported ? "available" : "UNAVAILABLE");
++    }
++#endif
+     std::string featureList;
+     for (auto featureName : requiredFeatures) {
+       featureList += "\n  ";
+diff --git a/lib/webgpu/gpu.hpp b/lib/webgpu/gpu.hpp
+index a1ce5c0..a54369d 100644
+--- a/lib/webgpu/gpu.hpp
++++ b/lib/webgpu/gpu.hpp
+@@ -60,6 +60,9 @@ extern bool g_hasCoreFeatures;
+ extern bool g_bcTexturesSupported;
+ extern bool g_astcTexturesSupported;
+ extern bool g_textureComponentSwizzleSupported;
++// Apple Vision Pro: SharedTextureMemoryIOSurface and SharedFenceMTLSharedEvent were both enabled on
++// the device (the OpenXR provider's swapchain images and the window's frames are IOSurfaces).
++extern bool g_metalSharedImageSupported;
+ extern bool g_dualSourceBlendingSupported;
+ 
+ bool initialize(AuroraBackend backend, bool allowCpu);
+diff --git a/lib/window.cpp b/lib/window.cpp
+index 6d08c55..81eceda 100644
+--- a/lib/window.cpp
++++ b/lib/window.cpp
+@@ -1,3 +1,6 @@
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#endif
+ #include "window.hpp"
+ 
+ #ifdef AURORA_ENABLE_GX
+@@ -319,7 +322,12 @@ const AuroraEvent* poll_events() {
+ 
+ bool create_window(AuroraBackend backend) {
+   SDL_WindowFlags flags = SDL_WINDOW_HIGH_PIXEL_DENSITY;
+-#if TARGET_OS_IOS || TARGET_OS_TV
++#if defined(__APPLE__) && TARGET_OS_VISION
++  // Apple Vision Pro: the window belongs to SDL's offscreen video driver
++  // (initialize() below) and is never shown. It must not start hidden, or
++  // is_paused() would wait for a show that never comes. Dawn's surface gets a
++  // CAMetalLayer of its own (lib/dawn/MetalBinding.mm).
++#elif TARGET_OS_IOS || TARGET_OS_TV
+   flags |= SDL_WINDOW_FULLSCREEN;
+ #else
+   flags |= SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE;
+@@ -410,6 +418,15 @@ bool initialize() {
+   /* We don't want to initialize anything input related here, otherwise the add events will get lost to the void */
+   TRY(SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight"), "Error setting {}: {}", SDL_HINT_ORIENTATIONS,
+       SDL_GetError());
++#if defined(__APPLE__) && TARGET_OS_VISION
++  // Apple Vision Pro: the app is a SwiftUI ImmersiveSpace driven by
++  // CompositorServices, so SDL never owns a UIKit window or the main thread.
++  // Its offscreen driver keeps every video call free of UIKit, which lets the
++  // whole game run on a thread of its own; joysticks (GameController) and
++  // audio (CoreAudio) are unaffected.
++  TRY(SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "offscreen"), "Error setting {}: {}", SDL_HINT_VIDEO_DRIVER,
++      SDL_GetError());
++#endif
+   TRY(SDL_InitSubSystem(SDL_INIT_EVENTS | SDL_INIT_VIDEO), "Error initializing SDL: {}", SDL_GetError());
+   time::internal::set_pause_reason(time::internal::PauseReason::Surface,
+                                    !g_surfaceReady.load(std::memory_order_acquire));
+diff --git a/lib/dolphin/pad/pad.cpp b/lib/dolphin/pad/pad.cpp
+index 4e135d2..1764c2a 100644
+--- a/lib/dolphin/pad/pad.cpp
++++ b/lib/dolphin/pad/pad.cpp
+@@ -1,3 +1,6 @@
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#endif
+ #include "../../input.hpp"
+ #include "../../device.hpp"
+ #include "../../internal.hpp"
+@@ -475,12 +478,22 @@ void PADClearPort(const u32 port) {
+ void __PADSetDefaultMapping(aurora::input::GameController* controller) /*  NOLINT(*-reserved-identifier) */
+ {
+   switch (SDL_GetGamepadType(controller->m_controller)) {
++#if defined(__APPLE__) && TARGET_OS_VISION
++  // Apple Vision Pro: every pad plays by its labels (A action, B the B button...), so the
++  // launcher's controller drawing, which shows the connected pad's own labels, is right for
++  // Xbox pads too (the GameCube-style mapping below swaps their side face buttons).
++  case SDL_GAMEPAD_TYPE_XBOX360:
++  case SDL_GAMEPAD_TYPE_XBOXONE:
++    controller->m_buttonMapping = g_defaultButtonsStandard;
++    break;
++#else
+   case SDL_GAMEPAD_TYPE_XBOX360:
+     controller->m_buttonMapping = g_defaultButtonsXBox360;
+     break;
+   case SDL_GAMEPAD_TYPE_XBOXONE:
+     controller->m_buttonMapping = g_defaultButtonsXBoxOne;
+     break;
++#endif
+   case SDL_GAMEPAD_TYPE_STANDARD:
+     controller->m_buttonMapping = g_defaultButtonsStandard;
+     break;

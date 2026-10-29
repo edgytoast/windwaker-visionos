@@ -15,6 +15,9 @@
 #if TARGET_PC
 #include "pc/pc_harness.h"
 #endif
+#if COS_VISIONOS
+#include "wwvr_vr.h" // visionos/host: the headset's controllers in Full and Progressive
+#endif
 
 JUTGamePad* g_mDoCPd_gamePad[4];
 interface_of_controller_pad g_mDoCPd_cpadInfo[4];
@@ -70,6 +73,9 @@ int mDoCPd_Read() {
 #if TARGET_PC
     // Step 6.3: the COS_INPUT script's state for this frame, as Aurora's virtual pad on port 0.
     pc_pad_feed();
+#endif
+#if COS_VISIONOS
+    wwvr_vr_pad_feed();
 #endif
     JUTGamePad::read();
 

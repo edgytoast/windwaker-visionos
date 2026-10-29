@@ -3,7 +3,8 @@
 Pins are the ones the build uses today; licenses marked "check" were not read from a local copy
 when this was written.
 
-SwitchWaker contains, builds against, or fetches at build time the components below. Nothing in this
+SwitchWaker, and Wind Waker VR (its Apple Vision Pro port), contain, build against, or fetch at
+build time the components below. Nothing in this
 list is game data: the repository contains no asset, executable or data file of the game, and every
 build reads them from the player's own disc.
 
@@ -18,16 +19,20 @@ build reads them from the player's own disc.
 | `switch/dawn/patches/` | Patches to Dawn (Horizon/OpenGL ES backend) | same as Dawn (BSD-3-Clause) |
 | `switch/mesa/patches/`, `switch/mesa/test/` | Patches to Mesa (devkitPro's switch-mesa recipe) and their tests | same as Mesa (MIT) |
 | `switch/forwarder/nx-hbloader-forwarder.patch` | Patch to nx-hbloader | same as nx-hbloader (ISC) |
+| `visionos/openxr-provider/` | The visionOS OpenXR provider of WiiCompiled Vision ([github.com/iChris4/Wiicompiled_VR](https://github.com/iChris4/Wiicompiled_VR), branch `vision-pro`), by way of Twilight Princess VR ([github.com/edgytoast/tpvr-visionos](https://github.com/edgytoast/tpvr-visionos)); local changes listed in its README; its `src/smaa/` is SMAA (MIT, `src/smaa/LICENSE.txt`) | GPL-3.0-or-later (`visionos/openxr-provider/LICENSE`) |
+| `visionos/TrevorbiltKit/` | The launcher Trevorbilt's ports share, vendored from [github.com/edgytoast/shar-visionos](https://github.com/edgytoast/shar-visionos) at the commit in its `VERSION` | MIT (`visionos/TrevorbiltKit/LICENSE`) |
+| `visionos/patches/aurora/`, `visionos/patches/dawn/` | Patches to Aurora and Dawn for visionOS (from the TPVR port, and new) | same as Aurora (MIT) and Dawn (BSD-3-Clause) |
 
 Everything else is the project's own code under the MIT license (`LICENSE`), copyright Pulpparty
-and depende3000, and the SwitchWaker contributors.
+and depende3000, and the SwitchWaker contributors, and, for the Apple Vision Pro port (`visionos/`
+and the changes made for it), Trevorbilt.
 
 ## Fetched at build time (not in the repository)
 
 | Component | Pin | Used for | License |
 |---|---|---|---|
 | [Aurora](https://github.com/encounter/aurora) | `3227d76` | GameCube SDK over WebGPU (GX, VI, PAD, DVD, CARD, THP) | MIT |
-| [Dawn](https://dawn.googlesource.com/dawn) | Mac: Aurora's prebuilt package; Switch: [encounter/dawn](https://github.com/encounter/dawn) `266c1cf` | WebGPU implementation | BSD-3-Clause |
+| [Dawn](https://dawn.googlesource.com/dawn) | Mac: Aurora's prebuilt package; Switch: [encounter/dawn](https://github.com/encounter/dawn) `266c1cf`; Apple Vision Pro: built from [encounter/dawn](https://github.com/encounter/dawn) `1155e0e` (Aurora's `AURORA_DAWN_REF`) with Dawn's own fetched dependencies and `visionos/patches/dawn/` (`visionos/scripts/build-dawn-visionos.sh`) | WebGPU implementation | BSD-3-Clause (its dependencies: their own licenses) |
 | [abseil-cpp](https://github.com/abseil/abseil-cpp) | Aurora's / Dawn's pin | Dawn dependency | Apache-2.0 |
 | [SDL 3](https://github.com/libsdl-org/SDL) | Aurora's pin (Mac); 3.4.10 headers (Switch, with this repository's libnx shim) | window, input, audio | Zlib |
 | [Dear ImGui](https://github.com/ocornut/imgui) | Aurora's pin; v1.91.9b-docking (Switch) | menus and overlays | MIT |
@@ -35,8 +40,13 @@ and depende3000, and the SwitchWaker contributors.
 | [xxHash](https://github.com/Cyan4973/xxHash) | Aurora's pin | hashing | BSD-2-Clause |
 | [Tracy](https://github.com/wolfpld/tracy) | Aurora's pin; v0.14.1 (headers only on the Switch) | profiler hooks (off) | BSD-3-Clause |
 | [SQLite](https://sqlite.org) | Aurora's pin | pipeline and texture caches | Public domain |
-| [nod](https://github.com/encounter/nod) | Aurora's prebuilt package (Mac only; the Switch uses `switch/native/nod`) | disc reader | MIT OR Apache-2.0 (check) |
+| [nod](https://github.com/encounter/nod) | Aurora's prebuilt package (Mac); built from source at Aurora's pin `v2.0.0-alpha.12`, with its Cargo crates (Apple Vision Pro); the Switch uses `switch/native/nod` | disc reader | MIT OR Apache-2.0 (check) |
+| [Corrosion](https://github.com/corrosion-rs/corrosion) | v0.6 (Aurora's pin) | builds nod's Rust from CMake (Apple Vision Pro; build tool only) | MIT |
+| [FreeType](https://freetype.org) | 2.14.3 (Aurora's pin) | font rendering | FreeType License (FTL) or GPL-2.0, at your option |
+| [libpng](https://www.libpng.org/pub/png/libpng.html) | 1.6.58 (Aurora's pin) | PNG decoding | libpng License |
+| [zstd](https://github.com/facebook/zstd) | 1.5.7 (Aurora's pin) | compression | BSD-3-Clause OR GPL-2.0 |
 | [RecompCore](https://github.com/elliotttate/RecompCore) (Dolphin) | `8ab24da` | Dolphin's DSP HLE sources (`native/tools/fetch_recompcore.sh`) | GPL-2.0-or-later |
+| [OpenXR SDK](https://github.com/KhronosGroup/OpenXR-SDK) headers | `release-1.1.61` (visionOS build only, `visionos/cmake/framework.cmake`) | the OpenXR API the visionOS client and provider use | Apache-2.0 |
 | [Mesa](https://mesa3d.org) | 20.1.0-rc3 via devkitPro's `switch-mesa` 20.1.0-5 recipe (`pacman-packages` `f103fe88`) | Switch EGL/GLES and nouveau driver | MIT |
 | [libnx](https://github.com/switchbrew/libnx), [devkitA64](https://devkitpro.org) | pinned devkitPro image digest | Switch runtime and toolchain | ISC (libnx); toolchain runtime libraries under their own licenses |
 | [nx-hbloader](https://github.com/switchbrew/nx-hbloader) | v2.4.5 (`82b9512`) | HOME-menu forwarder (optional) | ISC |
@@ -51,3 +61,8 @@ A build that includes `native/dsp_hle` (the default) links Dolphin's GPL-2.0-or-
 resulting `switchwaker` and `switchwaker.nro` are distributed under GPL-2.0-or-later terms, with their
 corresponding source. Builds contain code generated from the player's disc and are for the
 player's own use only.
+
+The Apple Vision Pro app (`WindWakerVision.app`) also links the visionOS OpenXR provider
+(GPL-3.0-or-later), so the app is GPL-3.0-or-later; its About tab links the source of each build.
+Like every build, it contains code generated from the player's disc and is for the player's own use
+only.

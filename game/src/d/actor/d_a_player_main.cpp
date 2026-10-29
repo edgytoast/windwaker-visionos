@@ -35,6 +35,9 @@
 #if TARGET_PC
 #include "helpers/endian.h"
 #endif
+#if COS_VISIONOS
+#include "wwvr_vr.h" // visionos/host: first person in Full and Progressive
+#endif
 #include "d/d_material.h"
 #include "JSystem/J3DGraphLoader/J3DAnmLoader.h"
 #include "d/actor/d_a_hookshot.h"
@@ -1713,7 +1716,51 @@ BOOL daPy_lk_c::draw() {
         mSightPacket.setSight();
     }
     g_env_light.settingTevStruct(TEV_TYPE_PLAYER, &current.pos, &tevStr);
+#if COS_VISIONOS
+    // VR in first person: the player's eyes are Link's, as in the game's own first-person view.
+    // His body isn't drawn; the sword he holds is, in the player's sword hand, and the shield in the
+    // other while he guards (wwvr_vr.h).
+    if (!checkPlayerNoDraw() && wwvr_vr_first_person()) {
+        offBodyEffect();
+        Mtx held;
+        if (mEquipItem == daPyItem_SWORD_e && checkSwordEquip() && mpEquipItemModel != NULL) {
+            J3DJoint* root = mpEquipItemModel->getModelData()->getJointNodePointer(0);
+            const Vec* mn = root->getMin();
+            const Vec* mx = root->getMax();
+            const f32 lo[3] = {mn->x, mn->y, mn->z}, hi[3] = {mx->x, mx->y, mx->z};
+            static bool sLogged = false;
+            if (!sLogged) {
+                sLogged = true;
+                OSReport("[WWVR] vr: sword bounds (%.1f %.1f %.1f) to (%.1f %.1f %.1f), %d joints\n", lo[0], lo[1], lo[2],
+                         hi[0], hi[1], hi[2], mpEquipItemModel->getModelData()->getJointNum());
+            }
+            if (wwvr_vr_held_mtx(0, lo, hi, 0, held)) {
+                mpEquippedSwordModel->setBaseTRMtx(held);
+                mpEquippedSwordModel->calc();
+                entryDLSetLight(mpEquippedSwordModel, checkFreezeState());
+                mpEquipItemModel->setBaseTRMtx(held);
+                mpEquipItemModel->calc();
+                entryDLSetLight(mpEquipItemModel, checkFreezeState());
+            }
+        }
+        if (checkShieldEquip() && CPad_CHECK_HOLD_R(0) && mpEquippedShieldModel != NULL) {
+            J3DJoint* root = mpEquippedShieldModel->getModelData()->getJointNodePointer(0);
+            const Vec* mn = root->getMin();
+            const Vec* mx = root->getMax();
+            const f32 lo[3] = {mn->x, mn->y, mn->z}, hi[3] = {mx->x, mx->y, mx->z};
+            if (wwvr_vr_held_mtx(1, lo, hi, 1, held)) {
+                mpEquippedShieldModel->setBaseTRMtx(held);
+                mpEquippedShieldModel->calc();
+                entryDLSetLight(mpEquippedShieldModel, checkFreezeState());
+            }
+        }
+        drawMirrorLightModel();
+        return TRUE;
+    }
     if (checkPlayerNoDraw()) {
+#else
+    if (checkPlayerNoDraw()) {
+#endif
         offBodyEffect();
         drawMirrorLightModel();
         return TRUE;

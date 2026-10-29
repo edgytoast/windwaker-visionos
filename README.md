@@ -1,277 +1,224 @@
-# SwitchWaker
+<p align="center">
+  <a href="https://trevorbilt.com"><img src="https://trevorbilt.com/assets/logo-BdrEikAq.png" alt="Trevorbilt" width="240"></a>
+</p>
 
-## What it is
+<h1 align="center">Wind Waker VR for Apple Vision Pro</h1>
 
-SwitchWaker is an unofficial native port of a 2002 GameCube adventure game (disc ID `GZLE01`, USA,
-revision 0) to the Mac, Linux and the Switch (homebrew). The game is compiled from its decompilation
-(the [`game/`](game/README.md) folder) and drawn with [Aurora](https://github.com/encounter/aurora);
-there is no CPU emulation.
+<p align="center"><b>The Great Sea, in real depth.</b></p>
 
-## Standing on the shoulders of others
+<p align="center">
+  <img src="visionos/docs/images/window-3d.jpg" alt="Link on Outset Island's pier, in a window floating in a living room" width="820">
+  <br><sub>The Window view in 3D, in the visionOS Simulator's living room.</sub>
+</p>
 
-SwitchWaker would not exist without these projects. The hard part, understanding the game, is
-their work; this repository adds the layer that runs it on new hardware.
+*The Legend of Zelda: The Wind Waker* (GameCube, 2002) running natively on Apple Vision Pro, in a
+window beside your other apps. It isn't a flat picture in a frame: the game's 3D scene is rebuilt
+behind the glass every frame, so Outset's cliffs, the pier and Link himself have real depth, and you
+can lean to see past the window's edge. No PC, no streaming: just the headset.
 
-- **[zeldaret/tww](https://github.com/zeldaret/tww)**: the community decompilation of the game.
-  The careful, byte-for-byte matching work of its contributors produced almost all of the code in
-  [`game/`](game/README.md). Without it there is nothing to port.
-- **[snrubrm/tww](https://github.com/snrubrm/tww)**: a personal fork of zeldaret/tww that completes
-  the functions still missing, with AI-assisted decompilation (in its author's words). `game/` was
-  imported from it; units that zeldaret has since matched are taken from zeldaret again.
-- **[encounter/aurora](https://github.com/encounter/aurora)**: the GameCube SDK reimplemented over
-  WebGPU (Dawn), which draws the game and reads the controllers on every platform, the Switch
-  included (with encounter's Dawn fork for it).
-- **[Dusklight](https://github.com/TwilitRealm/dusklight)** (TwilitRealm): the native port of a
-  sibling game on Aurora; the model for this project's SDK layer, and CC0 helper code.
-- **[Dolphin](https://dolphin-emu.org)**: its DSP HLE plays the game's audio (`native/dsp_hle/`, GPL).
-- **[elliotttate/Wind-Waker-Recomp](https://github.com/elliotttate/Wind-Waker-Recomp)** and
-  **[RecompCore](https://github.com/elliotttate/RecompCore)**: the static recompilation this work
-  started from, and the DSP adapter.
-- **[devkitPro](https://devkitpro.org)**, **[libnx](https://github.com/switchbrew/libnx)**,
-  **[Mesa](https://mesa3d.org)** and switch-mesa: the Switch toolchain and its OpenGL driver.
-- **[nx-hbloader](https://github.com/switchbrew/nx-hbloader)**,
-  **[hacBrewPack](https://github.com/TooTallNate/hacBrewPack)** and
-  **[hactool](https://github.com/SciresM/hactool)**: the HOME-menu forwarder.
+Wind Waker VR is [Trevorbilt](https://trevorbilt.com)'s native visionOS port of
+[SwitchWaker](https://github.com/centollOS/SwitchWaker), which compiles zeldaret's
+[decompilation](https://github.com/zeldaret/tww) natively on encounter's
+[Aurora](https://github.com/encounter/aurora). You bring the disc, you build the app, the King of Red
+Lions does the rest.
 
-If you enjoy this port, the decompilation projects above are where the credit belongs. Every
-component and its license: [THIRD_PARTY.md](THIRD_PARTY.md).
+> [!IMPORTANT]
+> There are no game files and no app download here. You need your own copy of the game (the
+> GameCube disc, USA) and a Mac to build with. Wind Waker VR is a fan project. It isn't affiliated
+> with or endorsed by Nintendo.
 
-## How it was made: AI use
+## What you get
 
-Be aware of this before you use or build on this repository:
+- **The Window view, in 3D.** The game plays with its own camera, and the world behind the glass
+  keeps its true shapes. The ground at the window's foot sits on the glass, the way it would
+  through a real window, so nothing bends as the camera moves.
+- **Or in 2D, like the original.** The button above the window's corner (or L1 and Create together
+  on a gamepad) flattens it back to the GameCube's own picture, and back again.
+- **A controller you already have.** A DualSense, an Xbox pad or any other gamepad, or both PS VR2
+  Sense controllers held as one. The camera turns the modern way by default; the Controls tab has
+  the GameCube's way round, and inverted up and down.
+- **Saves, as they always were.** Save from the game's own menu; your saves stay on the headset
+  between updates.
+- **Full and Progressive, if you're feeling brave.** First-person VR is in the app too, behind an
+  experimental switch: it runs in the Simulator, but it hasn't been played on a headset yet (more
+  under [Experimental](#experimental-full-and-progressive)).
 
-- **This project's own code was written with AI.** Nearly all of the code outside `game/` (the SDK
-  layer, the run harness, the Switch platform layer, patches, tools and scripts), the documentation
-  and the commit messages were written by an AI coding agent, Anthropic's Claude through Claude
-  Code. The human authors chose what to build, set the priorities, reviewed the code line by line,
-  played and tested it on the Mac and on a real Switch, reported the bugs and decided what went in.
-  Commits written with the agent say so in a `Co-Authored-By: Claude` line.
-- **Part of the decompilation is AI-assisted too**: the functions snrubrm/tww completed (see
-  above). The rest of `game/` is zeldaret's human work. If you want only human-written
-  decompilation, use [zeldaret/tww](https://github.com/zeldaret/tww).
-- **How it is checked**: human review of the code, line by line, plus builds on every platform, a
-  regression suite of boot milestones and smoke tests, automated sweeps over every stage, room,
-  actor, event, item and boss (also under AddressSanitizer), and play on hardware
-  ([native/README.md](native/README.md)). Bugs can still slip through; reports are welcome.
+<p align="center">
+  <img src="visionos/docs/images/window-angle.jpg" alt="Link on Windfall Island's dock, in a window seen from off to one side: he and the cliffs stand out of the sea behind the glass" width="620">
+  <br><sub>Windfall's dock, from off to one side (Simulator again). That's real depth back there, not a picture.</sub>
+</p>
 
-## What you need
+## What you'll need
 
-- **Your own legally obtained copy of the disc**: `GZLE01` revision 0, as an uncompressed `.iso`.
-  The build generates what it needs from it.
-- **This repository contains no game assets, executables or data.** The binaries you build contain
-  code generated from your disc: they are for your own use only; do not share them.
-- **No release binaries are provided** for now, precisely because they carry headers generated
-  from the disc compiled in.
+- **A headset:** Apple Vision Pro with visionOS 26 or later. It's played on visionOS 27.
+- **A Mac** with Apple silicon and Xcode at `/Applications/Xcode.app` (a path with a space in it
+  trips up CMake), with its visionOS platform installed. Built and tested with Xcode 27.1 on
+  macOS 27.
+- **Some tools:** [Homebrew](https://brew.sh), then `brew install cmake ninja xcodegen python rustup`,
+  and the Rust nightly the build pins (the [install guide](AVP-INSTALL.md#requirements) has the
+  lines).
+- **An Apple Account**, signed in to Xcode (Xcode › Settings › Accounts). The app asks for the
+  increased memory limit; it's been built with a paid developer team, and whether a free account
+  can sign it is untested.
+- **The game:** your own disc image of the USA release, **GZLE01, revision 0**, as an uncompressed
+  `.iso`.
+- **Patience:** about 5 GB of free disk, and an hour or two for the first build (it builds Dawn, the
+  graphics layer, once, then the whole game). Later builds take minutes.
 
-## Build on the Mac (Apple silicon)
+First time running your own app on a Vision Pro? Pair it with Xcode (Window › Devices and
+Simulators) and turn on [Developer Mode](https://developer.apple.com/documentation/xcode/enabling-developer-mode-on-a-device)
+on the headset. Apple's [guide to running on a device](https://developer.apple.com/documentation/xcode/running-your-app-on-simulated-or-physical-devices)
+walks through both.
 
-Requirements: Xcode command line tools, `brew install cmake ninja python` (Python 3.10 or newer)
-and the network the first time.
+## Build it
 
-```sh
-git clone https://github.com/centollOS/SwitchWaker switchwaker && cd switchwaker
-export COS_DISC=/path/to/GZLE01.iso          # every script and the game read the disc from here
-native/tools/fetch_recompcore.sh             # ref/recompcore: Dolphin's DSP HLE (audio)
-native/tools/gen_assets.sh                   # build/native-mac/assets/GZLE01: headers from your disc
-cmake -S native -B build/native-mac -G Ninja
-ninja -C build/native-mac switchwaker          # build/native-mac/switchwaker
-build/native-mac/switchwaker                   # a 960x720 window
+1. **Get the code.**
+
+   ```bash
+   git clone https://github.com/edgytoast/windwaker-visionos.git windwaker-visionos
+   cd windwaker-visionos
+   ```
+
+2. **Generate the game's asset headers from your disc, once.** The game's code includes data
+   generated from the disc, so the build makes it on your Mac (into `build/`, which git ignores) and
+   it never leaves there:
+
+   ```bash
+   COS_DISC=/path/to/your/GZLE01.iso native/tools/gen_assets.sh
+   ```
+
+3. **Build and install.** With the headset awake, unlocked and paired:
+
+   ```bash
+   visionos/scripts/build-visionos.sh --team YOURTEAMID --install
+   ```
+
+   Your team ID is the 10-character ID shown for your team in Xcode › Settings › Accounts.
+
+The full install guide, including everything the build does on your Mac, is
+[AVP-INSTALL.md](AVP-INSTALL.md).
+
+Fancy the visionOS Simulator instead? `visionos/scripts/build-visionos.sh --simulator` builds it
+unsigned. It's great for poking around, and terrible at judging looks: its GPU isn't the headset's.
+
+## Bring your game
+
+Wind Waker VR plays your own disc image of the USA release, **GZLE01, revision 0** (the original,
+not a later revision, the European or Japanese disc, or the Wii U's HD remaster), as an
+uncompressed `.iso`. A compressed `.rvz` or `.ciso` needs converting first (Dolphin can do it:
+right-click the game, Convert File, ISO). [Dolphin's guide](https://wiki.dolphin-emu.org/index.php?title=Ripping_Games)
+explains how to dump your disc. Any of these get it onto the headset:
+
+- **AirDrop** it to your Vision Pro and choose **Wind Waker VR** to open it with.
+- **From Files:** put it anywhere Files can reach, then tap **Import** in the app.
+- **By hand:** copy it into the app's own folder in Files (On My Apple Vision Pro › Wind Waker VR).
+
+The launcher checks the disc and tells you if it's another region or revision. Then tap **Play**.
+
+## Play
+
+The launcher has four tabs. **Play** has your disc and Play. **Controls** draws whatever you're
+holding (Sense controllers, a DualSense-style or Xbox-style pad) with every button labelled, and has
+the camera's directions. **Ports** browses the [AVP Ports Index](https://github.com/edgytoast/avp-ports-index)
+for more games. **About** has the credits, licences and an update check.
+
+The Window view plays like the original game, so it needs a controller: visionOS gives apps no hand
+tracking outside Full and Progressive. Look at the game's window to give it your controller (visionOS
+hands a controller to whichever window you're looking at).
+
+| Does | Gamepad | Sense controllers |
+|---|---|---|
+| Move | Left stick | Left stick (click: the small map) |
+| Camera | Right stick | Right stick (click: close the map) |
+| Action: talk, open, climb, roll | A | Cross |
+| Sword (hold to spin) | B | Circle |
+| Items on X and Y | X, Y | Square, Triangle |
+| Item on Z | Right shoulder | R1, the right grip |
+| Target | Left trigger | L2 |
+| Shield | Right trigger | R2 |
+| Items menu | Menu | Options |
+| Maps | D-pad (up: the map; left and right: the small map) | L1 (the map), Create (the small map) |
+| 2D or 3D | L1 + Create (LB + View) | the button above the window's corner |
+
+**Saving works the way it always did,** from the game's own menu. Close the window to quit; your
+progress is what you last saved.
+
+## Experimental: Full and Progressive
+
+Full puts the Great Sea all around you, in first person: your head is Link's, a swing of your sword
+hand is the sword, and the shield goes in the other. Progressive is the same through a portal the
+Digital Crown widens and narrows. They play with PS VR2 Sense controllers, your bare hands or a
+gamepad, and the Digital Crown pauses them.
+
+They're built and run in the Simulator, but they haven't been played on a headset yet. Stereo,
+comfort, frame rate, the hands and the Sense controllers are all untested there. If you'd like to
+try them anyway, turn on **Try Full and Progressive (experimental)** under the cards on Play, take it
+slow, and stop if anything feels off. The Controls tab then shows their buttons and gestures, and
+**Advanced** has turning (smooth or in steps), the sword hand, render resolution and anti-aliasing.
+[Reports](https://github.com/edgytoast/windwaker-visionos/issues) of how it went are very welcome.
+
+## Update
+
+Get the new code, then build and install again. If you came from the AVP Ports Index, run
+`git fetch`, then `git checkout` the commit Wind Waker VR's page there lists now (that's the code it
+scanned). If you cloned the `visionos` branch, `git pull`. Then:
+
+```bash
+visionos/scripts/build-visionos.sh --team YOURTEAMID --install
 ```
 
-Details, run options and tests: [native/README.md](native/README.md). Full regression:
-`native/tools/regress.sh`.
+Your disc and saves stay on the headset, and the asset headers stay in `build/`. The app's About
+tab says when a newer version is out.
 
-## Build on Linux (x86_64 or aarch64)
+## Known issues
 
-Requirements: clang (GCC is untested), CMake 3.28 or newer, Ninja, Python 3.10 or newer, git, and the
-development headers SDL 3 needs for its video and audio backends; at run time a Vulkan driver
-(any GPU's, or Mesa's). On Debian 13 / Ubuntu 24.04:
+- The 3D window shows a little less at its sides than the 2D picture: it frames the world the way a
+  real window would from where you sit, so wide side views (the pier from Outset's ledge, say) can
+  fall outside it. 2D shows all of it.
+- What comes very close to the game's camera is cut at the window's front, the way a camera's near
+  plane cuts, rather than poking out of the glass.
+- Torch flames look a little redder than on the GameCube, and the Forsaken Fortress at night looks
+  washed out in 3D (2D shows it as it should).
+- The first build is long, and it needs the network (Dawn, Aurora, the decompilation's tools and the
+  Rust crates are downloaded at pinned versions).
 
-```sh
-sudo apt install clang lld cmake ninja-build pkg-config python3 git zlib1g-dev \
-    libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev \
-    libxtst-dev libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev \
-    libegl-dev libgl-dev libgles-dev libvulkan-dev libdrm-dev libgbm-dev \
-    libasound2-dev libpulse-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev libibus-1.0-dev \
-    mesa-vulkan-drivers
-```
+Found something else? [Report a problem](https://github.com/edgytoast/windwaker-visionos/issues) (the About tab links
+there too).
 
-Then, as on the Mac but in `build/native-linux`:
+## Credits
 
-```sh
-git clone https://github.com/centollOS/SwitchWaker switchwaker && cd switchwaker
-export COS_DISC=/path/to/GZLE01.iso
-native/tools/fetch_recompcore.sh
-native/tools/gen_assets.sh --out build/native-linux/assets/GZLE01
-CC=clang CXX=clang++ cmake -S native -B build/native-linux -G Ninja
-ninja -C build/native-linux switchwaker        # build/native-linux/switchwaker
-build/native-linux/switchwaker
-```
+- **[Trevorbilt](https://trevorbilt.com)**: the Apple Vision Pro port: the visionOS app and its
+  launcher, the 3D window and its scene mirror, Full and Progressive, the input and the build.
+- **[SwitchWaker](https://github.com/centollOS/SwitchWaker)** (Pulpparty, depende3000 and the
+  SwitchWaker contributors): the native port of the decompilation on Aurora, for the Mac, Linux and
+  the Switch. This port builds directly on it; its own README is [SWITCHWAKER.md](SWITCHWAKER.md).
+- **[zeldaret/tww](https://github.com/zeldaret/tww)**: the community decompilation of the game,
+  with [snrubrm/tww](https://github.com/snrubrm/tww) completing the functions still missing.
+- **[encounter/aurora](https://github.com/encounter/aurora)**: the GameCube SDK over WebGPU, which
+  draws the game and reads the controllers.
+- **Twilight Princess VR**: the window's scene mirror, the stereo view and the VR hooks follow
+  [JoeyAW's TPVR](https://github.com/JoeyAW/TPVR) and Trevorbilt's
+  [visionOS port of it](https://github.com/edgytoast/tpvr-visionos), on Twilit Realm's
+  [Dusklight](https://github.com/TwilitRealm/dusklight).
+- **[iChris4/Wiicompiled_VR](https://github.com/iChris4/Wiicompiled_VR)**: WiiCompiled Vision, the
+  source of the visionOS OpenXR provider.
+- **[Dolphin](https://dolphin-emu.org)**: its DSP plays the game's audio, through elliotttate's
+  adapter from [Wind Waker Recomp](https://github.com/elliotttate/Wind-Waker-Recomp).
 
-Aurora draws with Vulkan, then OpenGL ES, then nothing (null) if neither works; `COS_BACKEND=opengl`
-(or `vulkan`, `opengles`, `null`) asks for one first. Dawn and nod come as Aurora's prebuilt
-packages, SDL 3 is built from source. The regression runs with
-`COS_BUILD_DIR=build/native-linux native/tools/regress.sh` (the link census and the duplicate
-symbol census are Mac-only and skipped). Headless (no display, no GPU, e.g. in a container):
-`COS_ALLOW_CPU_ADAPTER=1 xvfb-run -a native/tools/run.sh title` uses Mesa's software Vulkan.
+*The Legend of Zelda: The Wind Waker* is Nintendo's. This project isn't affiliated with or endorsed
+by Nintendo, and none of the game's files are in the app or the repository.
 
-## Build with Docker (any OS)
+## Licences
 
-`scripts/docker/build.sh` builds the Linux binary and/or the Switch NRO entirely in containers, on
-Linux, macOS, or Windows (in a WSL 2 shell, with Docker Desktop's WSL integration or Podman). The
-host needs only bash, git and Docker or Podman; the disc is bind-mounted read-only and never
-copied into an image.
+- Trevorbilt's code for the port and SwitchWaker's own code: **MIT** ([LICENSE](LICENSE)).
+- `game/`, the decompilation: **CC0-1.0** ([game/LICENSE](game/LICENSE)).
+- `native/dsp_hle/`, the audio over Dolphin's DSP: **GPL-2.0-or-later**.
+- `visionos/openxr-provider/`, from WiiCompiled Vision: **GPL-3.0-or-later**. The app links it, so
+  **the app you build is GPL-3.0**; About links the source of each build.
+- `visionos/TrevorbiltKit/`, the launcher Trevorbilt's ports share: MIT, with its fonts under the SIL
+  Open Font License 1.1. Trevorbilt's name, badge and app icons aren't covered by these licences.
 
-```sh
-scripts/docker/build.sh linux  --disc /path/to/GZLE01.iso   # build/native-linux/switchwaker
-scripts/docker/build.sh switch --disc /path/to/GZLE01.iso   # build/switch-native/switchwaker.nro
-scripts/docker/build.sh all    --disc /path/to/GZLE01.iso --test   # both, plus headless checks
-```
+[THIRD_PARTY.md](THIRD_PARTY.md) lists every component and its licence.
 
-The Linux binary is built for the container's architecture, which is the host's (x86_64 on a PC,
-aarch64 on Apple silicon); `--platform linux/amd64` builds the other one under emulation. The asset
-headers are generated once into `build/assets/GZLE01`. Downloads stay between runs in the
-repository's ignored `build/` and `ref/` folders (Aurora and its packages in
-`build/native-linux/_deps`, the decompilation and its tools in `build/decomp-docker`, RecompCore in
-`ref/recompcore`, Mesa in `build/switch-mesa/downloads`, Dawn's sources in `build/switch-native/_deps`)
-and in the engine's image cache; the first Switch build takes an hour or more, later ones minutes.
-`scripts/docker/build.sh --help` lists every option. On Windows, keep the clone inside the WSL file
-system (for example `~/switchwaker`), not under `/mnt/c`: builds there are much slower.
-
-## Windows (status)
-
-There is no native Windows build yet; it is low priority. Windows users can build the Linux binary
-(and run it under WSLg) or the Switch NRO with Docker, as above. What a native port would need, and
-an estimate: [docs/WINDOWS.md](docs/WINDOWS.md).
-
-## Continuous integration
-
-`.github/workflows/ci.yml` checks what can be checked without a disc: scripts lint, Aurora, the SDK
-layer and the run harness built and unit-tested on Linux x86_64 and aarch64, and the Switch build
-images cached. It runs only when started by hand (Actions tab, "Run workflow"), to keep the
-private repository's Actions minutes for when CI can build the game. **Full builds of the game always need your disc**, because headers generated from it
-are compiled in; [docs/RUNTIME_ASSETS.md](docs/RUNTIME_ASSETS.md) describes how that data could be
-loaded at run time instead, which would allow CI builds of the game and binary releases.
-
-## Build for the Switch
-
-**For players, the short way** (step-by-step guide: [INSTALL.md](INSTALL.md)):
-`scripts/switch/make_sd.sh --disc /path/to/GZLE01.iso` checks the disc, builds the NRO in containers
-and lays out `build/sd/switch/switchwaker/` (NRO, pipeline cache, a copy of the disc) for the SD card.
-
-On top of the above: Docker Desktop or Podman. `scripts/switch/build_native.sh` produces
-`build/switch-native/switchwaker.nro` (Mesa, Dawn and Aurora are built in a devkitPro container).
-Full guide: [docs/SWITCH_BUILD.md](docs/SWITCH_BUILD.md).
-
-## Install on the Switch
-
-### What you need
-
-- A Switch running custom firmware (Atmosphère) with the Homebrew Menu.
-- The NRO you built (`build/switch-native/switchwaker.nro`) and the bundled pipeline cache next to
-  it (`build/switch-native/initial_pipeline_cache.db`, copied there by the build).
-- Your disc as an **uncompressed** `.iso` (not RVZ, GCZ, CISO or NKit), renamed to `GZLE01.iso`.
-- About 1.6 GB free on the SD card (the disc is 1.4 GB; the shader caches grow to a few dozen MB).
-
-### Copy the files
-
-The SD card must end up like this (folder and file names exactly as shown):
-
-```
-sdmc:/switch/switchwaker/
-├── switchwaker.nro                the game
-├── GZLE01.iso                     your disc
-├── initial_pipeline_cache.db      the list of shaders to prepare on the first start
-└── native/                        created by the game: logs, saves, settings, caches
-```
-
-Either way works:
-
-- **By hand**: put the SD card in the computer (or mount it over USB with hekate's
-  *Tools → USB Tools → SD Card* or similar) and copy the three files into `switch/switchwaker/`.
-- **Over USB (MTP)**, from the repository: `scripts/switch/push.sh --disc /path/to/GZLE01.iso`
-  once, then `scripts/switch/push.sh native` (the NRO and the pipeline cache) after every build.
-  Every file is read back and checked. Needs `brew install libmtp` and USB file transfer enabled on
-  the console (DBI, haze or similar). Details: [docs/SWITCH_BUILD.md](docs/SWITCH_BUILD.md).
-
-Without `initial_pipeline_cache.db` the game still runs, but there is no first-start preparation:
-every shader is then built the first time it is drawn, and the game stutters for a long while.
-
-### Start the game
-
-- Open the Homebrew Menu **in title mode**: hold **R** while starting any installed game, then pick
-  **SwitchWaker**. Opened from the album (applet mode) the game has far too little memory and
-  will not run properly.
-- Or install the HOME-screen icon (forwarder), which always starts it in title mode:
-  build it with `scripts/switch/build_forwarder.sh` and install `switchwaker_forwarder.nsp` with
-  DBI ([switch/forwarder/INSTALL.md](switch/forwarder/INSTALL.md)).
-
-### The first start: preparing shaders
-
-The first start shows **"Preparing shaders (first start only)"** with a progress bar and the time
-left: the console compiles the graphics pipelines of the bundled list (about 3,000) so that the game
-does not stutter later. It takes **roughly 8 to 10 minutes** on a typical microSD (much longer on
-a slow card) and happens **only once**: later starts take a few seconds. A new version of the game
-may prepare a few new shaders again.
-
-- **Do not close the game (HOME → Close) while it is preparing shaders.** If it was interrupted,
-  the next start resumes where it stopped, but closing it mid-write can damage the shader
-  cache. If the game then fails to start or stutters again on every start, delete
-  `native/user/cache/` and let it prepare once more.
-- The text follows the console's language (Spanish or English).
-
-### Saves, settings and updates
-
-- Saves (the memory card): `sdmc:/switch/switchwaker/native/user/USA/Card A`. Back up this folder.
-- Settings from the options menu: `native/user/settings.ini`.
-- To update, replace `switchwaker.nro` (and `initial_pipeline_cache.db` if it changed). Saves,
-  settings and caches stay.
-- Logs, if something goes wrong: `native/switchwaker.log` (this run) and `switchwaker.prev.log`.
-- If you used this port's earlier SD folder (`sdmc:/switch/centollos/`), rename it to
-  `switchwaker` and rename `centollos.nro` to `switchwaker.nro`; the old path is no longer read.
-
-## Options
-
-- In-game options menu: **Minus (−)** on the Switch, **F1** (or L+R+Z) on the Mac and Linux. Saved to
-  `native/user/settings.ini`.
-- Language: the options menu and the shader loading screen are in Spanish or English, following the
-  console's language (on the Mac and Linux, `LANG`); `COS_LANG=es` or `COS_LANG=en` forces one.
-- `COS_*` variables (environment on the Mac and Linux, `sdmc:/switch/switchwaker/native/env.txt` on the
-  Switch): [switch/native/env.example.txt](switch/native/env.example.txt) and
-  [native/README.md](native/README.md).
-- HD textures (optional, a Dolphin-format pack you supply): [docs/HD_TEXTURES.md](docs/HD_TEXTURES.md).
-- 16:9 widescreen: [docs/WIDESCREEN.md](docs/WIDESCREEN.md).
-
-## Status
-
-Boots and plays on the Mac and the Switch, with sound, controllers, memory-card saves and an
-options menu. Played by hand mostly on the opening island and a few other areas; automated sweeps
-run on the Mac over every stage and room, every actor, particle effect, model and screen, every event
-of every stage, every item through its item-get demo, saves loaded back, every enemy fought and
-every boss room, also under AddressSanitizer ([native/README.md](native/README.md), "Sweeps"). The Switch
-does not yet hold a stable 30 fps everywhere. The Linux build boots to the same milestones and
-passes the regression in a container with software Vulkan (aarch64); it has not been played on a
-Linux desktop with a GPU yet.
-Known issues: [docs/NATIVE_PORT_PLAN.md](docs/NATIVE_PORT_PLAN.md), "Known bugs".
-
-## License
-
-- The project's own code: **MIT** ([LICENSE](LICENSE)).
-- `game/` (the decompilation): **CC0-1.0** ([game/LICENSE](game/LICENSE)).
-- `native/dsp_hle/` (audio, over Dolphin's DSP HLE): **GPL-2.0-or-later**
-  ([native/dsp_hle/LICENSE](native/dsp_hle/LICENSE)). Every build links it today, so **the
-  resulting binaries are GPL**.
-- Other components: [THIRD_PARTY.md](THIRD_PARTY.md). Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Disclaimer
-
-Independent project, not affiliated with or endorsed by any video game company. Trademarks
-mentioned or alluded to belong to their respective owners. No game content is included or
-distributed.
-
----
-
-## Authors
-
-Pulpparty, depende3000, and the SwitchWaker contributors, with an AI coding agent (see "How it was
-made: AI use"). Thanks to everyone behind the projects in "Standing on the shoulders of others".
+If you enjoy it, the rest of what I make is at [trevorbilt.com](https://trevorbilt.com), and the
+[Ports tab](https://github.com/edgytoast/avp-ports-index) has more games for your Vision Pro.

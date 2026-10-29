@@ -34,6 +34,12 @@ endif ()
 
 file(GLOB _patches LIST_DIRECTORIES false "${COS_AURORA_PATCH_DIR}/*.patch")
 list(SORT _patches)
+# A platform's own patches after them (Aurora.cmake's COS_AURORA_EXTRA_PATCH_DIR: visionOS).
+if (COS_AURORA_EXTRA_PATCH_DIR)
+    file(GLOB _extra LIST_DIRECTORIES false "${COS_AURORA_EXTRA_PATCH_DIR}/*.patch")
+    list(SORT _extra)
+    list(APPEND _patches ${_extra})
+endif ()
 foreach (_patch IN LISTS _patches)
     get_filename_component(_name "${_patch}" NAME)
     execute_process(COMMAND "${COS_GIT}" apply --reverse --check "${_patch}"

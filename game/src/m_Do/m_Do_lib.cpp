@@ -13,6 +13,9 @@
 #include "dolphin/gx/GX.h"
 #if TARGET_PC
 #include "helpers/endian.h"
+#if COS_VISIONOS
+#include "wwvr_window.h" // visionos/host: the Window view's wider view in 3D
+#endif
 #endif
 
 /* 80017530-800176BC       .text mDoLib_setResTimgObj__FP7ResTIMGP9_GXTexObjUlP10_GXTlutObj */
@@ -103,9 +106,28 @@ void mDoLib_project(Vec* src, Vec* dst) {
         ySize = viewPort->mHeight;
     }
 
+#if COS_VISIONOS
+    // The Window view in 3D draws wider than its picture (wwvr_window.h): the place in the picture,
+    // where the HUD over it and the game's own checks expect it.
+    f3 *= wwvr_window_projection_scale();
+#endif
     dst->x = ((0.5f + (dst->x * f3)) * xSize) + xOffset;
     dst->y = ((0.5f + (dst->y * (-f3))) * ySize) + yOffset;
 }
+
+#if COS_VISIONOS
+void mDoLib_pictureToDrawn(f32* x, f32* y) {
+    const f32 scale = wwvr_window_projection_scale();
+    const view_port_class* viewport = dComIfGd_getViewport();
+    if (scale == 1.0f || viewport == NULL) {
+        return;
+    }
+    // About the viewport's centre, as mDoLib_project places it.
+    const f32 cx = viewport->mXOrig + 0.5f * viewport->mWidth, cy = viewport->mYOrig + 0.5f * viewport->mHeight;
+    *x = cx + (*x - cx) / scale;
+    *y = cy + (*y - cy) / scale;
+}
+#endif
 
 /* 80017924-80017960       .text mDoLib_pos2camera__FP3VecP3Vec */
 void mDoLib_pos2camera(Vec* src, Vec* dst) {

@@ -125,6 +125,13 @@ include(cmake/sdk_gf.cmake)
 include(cmake/census.cmake)
 # The game executable (phase 3, step 3.8): `ninja switchwaker` links every module, cos_sdk and Aurora.
 include(cmake/executable.cmake)
+# Apple Vision Pro (visionos/, visionos/scripts/build-visionos.sh): the game as a framework for the
+# SwiftUI app, and the Window view's hooks in the painter (COS_VISIONOS).
+if (CMAKE_SYSTEM_NAME STREQUAL "visionOS")
+    target_compile_definitions(cos_game_headers INTERFACE COS_VISIONOS=1)
+    target_include_directories(cos_game_headers INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/../visionos/host")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/../visionos/cmake/framework.cmake")
+endif ()
 # Layout check (phase 4, step 4.0c): `ninja cos_layout_check` asserts the GameCube offsets of the
 # disc-mapped structs (check/layout_headers.txt) on the host, minus check/layout_xfail.txt.
 include(cmake/layout_check.cmake)

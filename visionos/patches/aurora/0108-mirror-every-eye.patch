@@ -1,0 +1,348 @@
+diff --git a/lib/gx/mirror.cpp b/lib/gx/mirror.cpp
+index b7f0b93..3fd0cdb 100644
+--- a/lib/gx/mirror.cpp
++++ b/lib/gx/mirror.cpp
+@@ -403,7 +403,8 @@ struct Built {
+ 
+ struct Stats {
+   uint64_t draws = 0, recorded = 0, merged = 0, lines = 0, screen = 0, noColour = 0, viewport = 0, projection = 0, blend = 0,
+-           copyOnly = 0, alphaNever = 0, vertices = 0, triangles = 0, background = 0, behind = 0, frames = 0;
++           copyOnly = 0, alphaNever = 0, vertices = 0, triangles = 0, background = 0, behind = 0, frames = 0,
++           bakes = 0, bakeTexels = 0;
+   double seconds = 0;
+ };
+ 
+@@ -693,9 +694,12 @@ struct Baked {
+   uint64_t id = 0;
+   uint64_t key = 0; // what it was baked from
+   uint32_t lastFrame = 0;
++  uint32_t bakedFrame = 0; // 0108: when it was last baked (a bake is never more than a few frames old)
+ };
+ std::unordered_map<uint64_t, Baked> g_baked;           // FIFO thread
+ std::unordered_map<uint64_t, unsigned> g_bakeOccurrences; // this frame's, by texture pair
++uint64_t g_bakeTexels = 0;                          // 0108: this frame's
++std::unordered_map<uint64_t, uint64_t> g_bakeKeys; // 0108: this frame's: what was baked -> its texture
+ 
+ void forget_textures() {
+   g_lookupPixels.clear();
+@@ -747,7 +751,9 @@ void sweep_textures(bool all = false) {
+   }
+   for (auto it = g_baked.begin(); it != g_baked.end();) {
+     if (all || g_frame - it->second.lastFrame > 900) {
+-      g_removedTextures.push_back(it->second.id);
++      if (it->second.id != 0) {
++        g_removedTextures.push_back(it->second.id);
++      }
+       it = g_baked.erase(it);
+     } else {
+       ++it;
+@@ -1432,6 +1438,9 @@ const bool kOverHair = switch_on("AURORA_MIRROR_OVER_HAIR");
+ // 0107 test switch: AURORA_MIRROR_REAL_SHADOWS=0 reads a real-time shadow's blend as before
+ // (additive: no shadow).
+ const bool kRealShadows = switch_on("AURORA_MIRROR_REAL_SHADOWS");
++// 0108 test switch: AURORA_MIRROR_BAKE=0 bakes two textures into one only for the eyes over the
++// hair, as 0105 did.
++const bool kBakePairs = switch_on("AURORA_MIRROR_BAKE");
+ 
+ bool colour_coord(const ShaderConfig& config, int coord) {
+   if (coord < 0 || coord >= static_cast<int>(MaxTexCoord)) {
+@@ -2762,6 +2771,8 @@ void log_skipped(const ShaderConfig& config, const MirrorPart& part, u16 vtxCoun
+ 
+ void begin_frame() {
+   g_bakeOccurrences.clear();
++  g_bakeKeys.clear();
++  g_bakeTexels = 0;
+   const size_t passes = g_passes.size();
+   g_passes.clear();
+   g_passes.reserve(passes);
+@@ -2952,6 +2963,7 @@ struct Job {
+ 
+ std::mutex g_jobMutex;
+ std::condition_variable g_jobReady;
++std::condition_variable g_jobTaken; // 0108: for AURORA_MIRROR_NO_DROP
+ Job g_job; // handed over, waiting for the worker
+ bool g_jobPending = false;
+ std::atomic<uint64_t> g_finishNanos{0}, g_finished{0}, g_dropped{0};
+@@ -3137,6 +3149,7 @@ void worker_main() {
+       std::swap(work, g_job);
+       g_jobPending = false;
+     }
++    g_jobTaken.notify_one();
+     const auto started = std::chrono::steady_clock::now();
+     const uint64_t finishCpu = thread_cpu_ns();
+     finish(work);
+@@ -3164,8 +3177,17 @@ void publish(bool scene, float focus) {
+   }
+   static std::once_flag started;
+   std::call_once(started, [] { std::thread(worker_main).detach(); });
++  // 0108 test switch: AURORA_MIRROR_NO_DROP=1 waits for the finishing worker instead of dropping the
++  // frame's geometry, so every game frame has its mirror frame (comparisons of a held frame).
++  static const bool s_noDrop = [] {
++    const char* value = std::getenv("AURORA_MIRROR_NO_DROP");
++    return value != nullptr && std::strcmp(value, "1") == 0;
++  }();
+   {
+-    std::lock_guard lock(g_jobMutex);
++    std::unique_lock lock(g_jobMutex);
++    if (s_noDrop) {
++      g_jobTaken.wait(lock, [] { return !g_jobPending; });
++    }
+     if (g_jobPending) {
+       ++g_dropped;
+     } else {
+@@ -3211,9 +3233,11 @@ void publish(bool scene, float focus) {
+              static_cast<double>(g_finishNanos.exchange(0)) / finished / 1e6, g_dropped.exchange(0), g_textures.size());
+     {
+       const double scenes = static_cast<double>(std::max<uint64_t>(g_scenes.exchange(0), 1));
+-      Log.info("mirror: CPU per frame: FIFO thread over the scene {:.2f} ms, finishing {:.2f} ms",
++      Log.info("mirror: CPU per frame: FIFO thread over the scene {:.2f} ms, finishing {:.2f} ms; {:.2f} bakes "
++               "({:.0f} texels)",
+                static_cast<double>(g_sceneCpuNanos.exchange(0)) / scenes / 1e6,
+-               static_cast<double>(g_finishCpuNanos.exchange(0)) / finished / 1e6);
++               static_cast<double>(g_finishCpuNanos.exchange(0)) / finished / 1e6, g_stats.bakes / f,
++               g_stats.bakeTexels / f);
+     }
+     log_tally(f);
+     Log.info("mirror: glass at {:.0f} (focus {:.0f}), {:.1f}% of vertices moved nearer it (into its band, or "
+@@ -3320,11 +3344,42 @@ bool coord_affine(const DrawJob& job, int coord, std::array<float, 6>& a, int* s
+ // other texture at zero and at each channel, the kept one left unknown), which a product of the two
+ // is. Under an id per pair and per draw of the frame, baked again in place only when the map or the
+ // TEV changes. Only for draws with no raster colour (their TEV is the textures alone).
+-bool bake_pair(DrawJob& job, MirrorPart& part) {
++//
++// 0108: not only the eyes drawn over the hair: every draw built that way. The other characters'
++// eyes are such a draw, an ordinary alpha blend after the face (Aryll's: the iris, scrolled as she
++// looks around, times the eye's white, whose alpha is the eye's shape): with the shape averaged, a
++// faint square of iris colour over the face, and no eyes. Outside the eyes over the hair, textures
++// up to kBakeMaxTexels only (the CPU keeps their pixels), a bake already made this frame from the
++// same is shared (a texture tiled over many draws), and at most kBakeTexelsPerFrame texels are
++// baked a frame (a texture scrolled every frame is baked again every frame): past it, a bake made
++// before stays as it is, for three frames at most (then it's baked whatever the budget), or the
++// draw waits a frame for its first.
++bool reads_raster(const ShaderConfig& config) {
++  for (u32 i = 0; i < config.tevStageCount; ++i) {
++    const TevStage& stage = config.tevStages[i];
++    const auto& c = stage.colorPass;
++    const auto& a = stage.alphaPass;
++    for (const GXTevColorArg arg : {c.a, c.b, c.c, c.d}) {
++      if (arg == GX_CC_RASC || arg == GX_CC_RASA) {
++        return true;
++      }
++    }
++    for (const GXTevAlphaArg arg : {a.a, a.b, a.c, a.d}) {
++      if (arg == GX_CA_RASA) {
++        return true;
++      }
++    }
++  }
++  return false;
++}
++constexpr uint32_t kBakeMaxTexels = 128 * 128;
++constexpr uint64_t kBakeTexelsPerFrame = 128 * 128 * 12;
++
++bool bake_pair(DrawJob& job, MirrorPart& part, bool overHair) {
+   DrawPlan& plan = job.plan;
+   const ShaderConfig& config = job.config;
+   if (plan.primary == nullptr || plan.primary->captured || plan.behindMap >= 0 || plan.anyLookup ||
+-      plan.rasterUsed[0] || plan.rasterUsed[1]) {
++      (overHair ? plan.rasterUsed[0] || plan.rasterUsed[1] : reads_raster(config))) {
+     return false;
+   }
+   int other = -1, otherCoord = -1;
+@@ -3363,6 +3418,10 @@ bool bake_pair(DrawJob& job, MirrorPart& part) {
+       !coord_affine(job, otherCoord, otherMap, &otherSource) || primarySource != otherSource) {
+     return false;
+   }
++  if (!overHair && (primaryObj.width() * primaryObj.height() > kBakeMaxTexels ||
++                    otherObj.width() * otherObj.height() > kBakeMaxTexels)) {
++    return false;
++  }
+   const auto primaryPixels = lookup_pixels(*plan.primary, primaryObj);
+   const auto otherPixels = lookup_pixels(*otherEntry, otherObj);
+   if (!primaryPixels || !otherPixels) {
+@@ -3419,20 +3478,48 @@ bool bake_pair(DrawJob& job, MirrorPart& part) {
+   }
+   key.primaryBase = primaryBase;
+   const uint64_t keyHash = xxh3_hash_s(&key, sizeof key);
++  const GXTexObj_& baseObj = primaryBase ? primaryObj : otherObj;
++  const auto use = [&](uint64_t id) {
++    part.texture = id;
++    part.wrapS = static_cast<uint8_t>(std::min<int>(baseObj.wrap_s(), 2));
++    part.wrapT = static_cast<uint8_t>(std::min<int>(baseObj.wrap_t(), 2));
++    plan.primaryCoord = primaryBase ? plan.primaryCoord : otherCoord;
++    job.baked = true;
++    return true;
++  };
++  // 0108: made already this frame.
++  if (const auto made = g_bakeKeys.find(keyHash); made != g_bakeKeys.end()) {
++    return use(made->second);
++  }
+   const uint64_t pair[2] = {key.primary, key.other};
+   const uint64_t pairHash = xxh3_hash_s(pair, sizeof pair);
+   const uint64_t slot[2] = {pairHash, g_bakeOccurrences[pairHash]++};
+   Baked& baked = g_baked[xxh3_hash_s(slot, sizeof slot)];
+-  if (baked.id == 0) {
+-    baked.id = g_nextTextureId++;
+-  }
+-  baked.lastFrame = g_frame;
+   const LookupPixels& base = primaryBase ? *primaryPixels : *otherPixels;
+   const LookupPixels& read = primaryBase ? *otherPixels : *primaryPixels;
+   const uint8_t readWrapS = static_cast<uint8_t>(primaryBase ? otherObj.wrap_s() : primaryObj.wrap_s());
+   const uint8_t readWrapT = static_cast<uint8_t>(primaryBase ? otherObj.wrap_t() : primaryObj.wrap_t());
++  const uint64_t texels = static_cast<uint64_t>(base.width) * base.height;
++  if (baked.key != keyHash && !overHair && g_bakeTexels + texels > kBakeTexelsPerFrame &&
++      (baked.id == 0 || g_frame - baked.bakedFrame < 3)) {
++    // 0108: over the frame's budget: the last bake a frame longer, or none yet.
++    if (baked.id == 0) {
++      return false;
++    }
++    baked.lastFrame = g_frame;
++    return use(baked.id);
++  }
++  if (baked.id == 0) {
++    baked.id = g_nextTextureId++;
++  }
++  baked.lastFrame = g_frame;
++  g_bakeKeys.emplace(keyHash, baked.id);
+   if (baked.key != keyHash) {
+     baked.key = keyHash;
++    baked.bakedFrame = g_frame;
++    g_bakeTexels += texels;
++    ++g_stats.bakes;
++    g_stats.bakeTexels += texels;
+     std::vector<uint8_t> rgba(static_cast<size_t>(base.width) * base.height * 4);
+     for (uint32_t y = 0; y < base.height; ++y) {
+       for (uint32_t x = 0; x < base.width; ++x) {
+@@ -3465,17 +3552,114 @@ bool bake_pair(DrawJob& job, MirrorPart& part) {
+     const bool cutout = binary_alpha(rgba);
+     g_newTextures.push_back({baked.id, std::move(rgba), base.width, base.height, false, cutout});
+   }
+-  part.texture = baked.id;
+-  const GXTexObj_& baseObj = primaryBase ? primaryObj : otherObj;
+-  part.wrapS = static_cast<uint8_t>(std::min<int>(baseObj.wrap_s(), 2));
+-  part.wrapT = static_cast<uint8_t>(std::min<int>(baseObj.wrap_t(), 2));
+-  plan.primaryCoord = primaryBase ? plan.primaryCoord : otherCoord;
+-  job.baked = true;
+-  return true;
++  return use(baked.id);
++}
++
++// 0108 test switch: AURORA_MIRROR_TRACE_TAG=<game frame> logs every draw of the game's frame n (the
++// BEGIN mark's number, as the window and the perf lines count; merged ones aside) with its whole
++// state: blend, depth, colour and alpha writes, the destination alpha, the TEV's stages, registers
++// and channels, the texture coordinates, and each texture (its pixels written once as PPM and PGM
++// into TMPDIR). For finding how the game draws something the mirror gets wrong.
++void trace_draw(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount) {
++  const auto& st = g_gxState;
++  std::string text = fmt::format(
++      "mirror draw {}: rec {} off {} prim {} n {} proj {} blend {} {}->{} op {} depth {}/{}{} cull {} colour {} alpha {} "
++      "dstalpha {} test {} {} {} {} {} | regs",
++      g_frameTag, g_recording, g_offscreen, static_cast<int>(prim), vtxCount, static_cast<int>(st.projType),
++      static_cast<int>(st.blendMode), static_cast<int>(st.blendFacSrc), static_cast<int>(st.blendFacDst),
++      static_cast<int>(st.blendOp), st.depthCompare ? "test" : "-", static_cast<int>(st.depthFunc),
++      st.depthUpdate ? "+write" : "", static_cast<int>(st.cullMode), st.colorUpdate, st.alphaUpdate,
++      st.dstAlpha == UINT32_MAX ? -1 : static_cast<int>(st.dstAlpha), static_cast<int>(config.alphaCompare.comp0),
++      config.alphaCompare.ref0, static_cast<int>(config.alphaCompare.op), static_cast<int>(config.alphaCompare.comp1),
++      config.alphaCompare.ref1);
++  for (const auto& r : st.colorRegs) {
++    text += fmt::format(" ({:.2f} {:.2f} {:.2f} {:.2f})", r[0], r[1], r[2], r[3]);
++  }
++  text += " k";
++  for (const auto& r : st.kcolors) {
++    text += fmt::format(" ({:.2f} {:.2f} {:.2f} {:.2f})", r[0], r[1], r[2], r[3]);
++  }
++  for (int c = 0; c < 4; ++c) {
++    const auto& cc = st.colorChannelConfig[c];
++    const auto& cs = st.colorChannelState[c];
++    text += fmt::format(" ch{} {}{}{} mat ({:.2f} {:.2f} {:.2f} {:.2f}) amb ({:.2f} {:.2f} {:.2f} {:.2f})", c,
++                        cc.lightingEnabled ? "lit" : "-", static_cast<int>(cc.matSrc), static_cast<int>(cc.ambSrc),
++                        cs.matColor[0], cs.matColor[1], cs.matColor[2], cs.matColor[3], cs.ambColor[0], cs.ambColor[1],
++                        cs.ambColor[2], cs.ambColor[3]);
++  }
++  text += fmt::format(" clr0 {} clr1 {} |", static_cast<int>(config.attrs[GX_VA_CLR0].attrType),
++                      static_cast<int>(config.attrs[GX_VA_CLR1].attrType));
++  for (u32 i = 0; i < config.tevStageCount; ++i) {
++    const auto& stage = config.tevStages[i];
++    text += fmt::format(" [{}: t{} m{} ch{} c {} {} {} {} op{}b{}s{}c{}>{} a {} {} {} {} op{}b{}s{}c{}>{} k{}/{} sw{}/{}", i,
++                        static_cast<int>(stage.texCoordId), static_cast<int>(stage.texMapId),
++                        static_cast<int>(stage.channelId), static_cast<int>(stage.colorPass.a),
++                        static_cast<int>(stage.colorPass.b), static_cast<int>(stage.colorPass.c),
++                        static_cast<int>(stage.colorPass.d), static_cast<int>(stage.colorOp.op),
++                        static_cast<int>(stage.colorOp.bias), static_cast<int>(stage.colorOp.scale),
++                        stage.colorOp.clamp ? 1 : 0, static_cast<int>(stage.colorOp.outReg),
++                        static_cast<int>(stage.alphaPass.a), static_cast<int>(stage.alphaPass.b),
++                        static_cast<int>(stage.alphaPass.c), static_cast<int>(stage.alphaPass.d),
++                        static_cast<int>(stage.alphaOp.op), static_cast<int>(stage.alphaOp.bias),
++                        static_cast<int>(stage.alphaOp.scale), stage.alphaOp.clamp ? 1 : 0,
++                        static_cast<int>(stage.alphaOp.outReg), static_cast<int>(stage.kcSel),
++                        static_cast<int>(stage.kaSel), static_cast<int>(stage.tevSwapRas),
++                        static_cast<int>(stage.tevSwapTex));
++    if (stage.texMapId < MaxTextures) {
++      const auto& obj = st.loadedTextures[stage.texMapId];
++      text += fmt::format(" tex f{} {}x{} w{}{} {:p}{}", obj.format(), obj.width(), obj.height(), static_cast<int>(obj.wrap_s()),
++                          static_cast<int>(obj.wrap_t()), obj.data, st.copyTextures.contains(obj.data) ? " copy" : "");
++      static std::unordered_map<const void*, bool> written;
++      const char* tmp = std::getenv("TMPDIR");
++      if (tmp != nullptr && obj.has_data() && !st.copyTextures.contains(obj.data) && written.emplace(obj.data, true).second) {
++        const auto rgba = decode(obj, palette_of(obj));
++        if (!rgba.empty()) {
++          const std::string base = fmt::format("{}/mirror-tex-{:p}-{}x{}-f{}", tmp, obj.data, obj.width(), obj.height(), obj.format());
++          if (FILE* f = std::fopen((base + ".ppm").c_str(), "wb")) {
++            std::fprintf(f, "P6 %u %u 255\n", obj.width(), obj.height());
++            for (size_t p = 0; p < rgba.size(); p += 4) {
++              std::fwrite(&rgba[p], 1, 3, f);
++            }
++            std::fclose(f);
++          }
++          if (FILE* f = std::fopen((base + ".pgm").c_str(), "wb")) {
++            std::fprintf(f, "P5 %u %u 255\n", obj.width(), obj.height());
++            for (size_t p = 3; p < rgba.size(); p += 4) {
++              std::fwrite(&rgba[p], 1, 1, f);
++            }
++            std::fclose(f);
++          }
++        }
++      }
++    }
++    text += "]";
++  }
++  for (u32 i = 0; i < MaxTexCoord; ++i) {
++    const auto& tcg = config.tcgs[i];
++    if (tcg.src != GX_MAX_TEXGENSRC) {
++      text += fmt::format(" tcg{} t{} s{} m{} p{}{}", i, static_cast<int>(tcg.type), static_cast<int>(tcg.src),
++                          static_cast<int>(tcg.mtx), static_cast<int>(tcg.postMtx), tcg.normalize ? " n" : "");
++      if (tcg.mtx != GX_IDENTITY && tcg.mtx >= GX_TEXMTX0) {
++        const auto& m = st.texMtxs[std::min<u32>((tcg.mtx - GX_TEXMTX0) / 3, MaxTexMtx - 1)];
++        text += fmt::format(" [{:.3f} {:.3f} {:.3f} {:.3f} / {:.3f} {:.3f} {:.3f} {:.3f}]", m.m0[0], m.m0[1], m.m0[2],
++                            m.m0[3], m.m1[0], m.m1[1], m.m1[2], m.m1[3]);
++      }
++    }
++  }
++  const auto& m = st.pnMtx[std::min<u32>(st.currentPnMtx, MaxPnMtx - 1)].pos;
++  text += fmt::format(" at ({:.0f} {:.0f} {:.0f})", m.m0[3], m.m1[3], m.m2[3]);
++  Log.info("{}", text);
+ }
+ 
+ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8* vertices, const u16* indices,
+             u32 indexCount, bool merged) noexcept {
++  static const long s_traceTag = [] {
++    const char* value = std::getenv("AURORA_MIRROR_TRACE_TAG");
++    return value != nullptr ? std::atol(value) : -1L;
++  }();
++  if (s_traceTag >= 0 && static_cast<long>(g_frameTag) == s_traceTag && !merged) {
++    trace_draw(prim, config, vtxCount);
++  }
+   // 0107 test switch: AURORA_MIRROR_TRACE_FRAME=<n> logs every draw of mirror frame n (merged ones
+   // aside), recorded or not, with its state: what the scene is made of, and what the mirror skips.
+   static const long s_traceFrame = [] {
+@@ -3740,8 +3924,8 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+   if (behind) {
+     job.channelSel[3] = -1; // alpha carries the opacity
+   }
+-  // 0105: an eye's two textures, baked into one.
+-  if (overHair && bake_pair(job, part)) {
++  // 0105: an eye's two textures, baked into one (0108: any draw's two, AURORA_MIRROR_BAKE=0 aside).
++  if ((overHair || kBakePairs) && bake_pair(job, part, overHair)) {
+     for (int c = 0; c < 4; ++c) {
+       job.channelSel[c] = static_cast<int8_t>(c);
+     }

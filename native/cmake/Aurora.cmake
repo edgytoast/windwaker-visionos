@@ -64,6 +64,15 @@ get_filename_component(COS_AURORA_PATCH_DIR "${COS_AURORA_PATCH_DIR}" ABSOLUTE)
 set(_cos_aurora_patch_script "${CMAKE_CURRENT_LIST_DIR}/aurora_apply_patches.cmake")
 file(GLOB _cos_aurora_patches LIST_DIRECTORIES false CONFIGURE_DEPENDS "${COS_AURORA_PATCH_DIR}/*.patch")
 list(SORT _cos_aurora_patches)
+# Apple Vision Pro (visionos/patches/aurora): a platform's own patches, applied after these, in
+# name order (the visionOS build sets it; other hosts build Aurora exactly as before).
+set(COS_AURORA_EXTRA_PATCH_DIR "" CACHE PATH "Further Aurora patches, applied after native/patches/aurora")
+if (COS_AURORA_EXTRA_PATCH_DIR)
+    file(GLOB _cos_aurora_extra_patches LIST_DIRECTORIES false CONFIGURE_DEPENDS
+            "${COS_AURORA_EXTRA_PATCH_DIR}/*.patch")
+    list(SORT _cos_aurora_extra_patches)
+    list(APPEND _cos_aurora_patches ${_cos_aurora_extra_patches})
+endif ()
 set(_cos_aurora_patch_key "")
 foreach (_patch IN LISTS _cos_aurora_patches)
     file(SHA256 "${_patch}" _hash)
@@ -119,7 +128,8 @@ if (FETCHCONTENT_SOURCE_DIR_AURORA AND _cos_aurora_patches AND NOT COS_AURORA_PR
         list(FILTER _entries EXCLUDE REGEX "/\\.git$")
         file(COPY ${_entries} DESTINATION "${_cos_aurora_copy}")
         execute_process(COMMAND "${CMAKE_COMMAND}" -DCOS_AURORA_SRC=${_cos_aurora_copy}
-                -DCOS_AURORA_PATCH_DIR=${COS_AURORA_PATCH_DIR} -P "${_cos_aurora_patch_script}"
+                -DCOS_AURORA_PATCH_DIR=${COS_AURORA_PATCH_DIR}
+                -DCOS_AURORA_EXTRA_PATCH_DIR=${COS_AURORA_EXTRA_PATCH_DIR} -P "${_cos_aurora_patch_script}"
                 RESULT_VARIABLE _result)
         if (NOT _result EQUAL 0)
             message(FATAL_ERROR "cos_native: patching the Aurora copy failed")
@@ -137,6 +147,7 @@ FetchContent_Declare(aurora
         GIT_TAG "${COS_AURORA_COMMIT}"
         PATCH_COMMAND "${CMAKE_COMMAND}" -DCOS_AURORA_SRC=<SOURCE_DIR>
             -DCOS_AURORA_PATCH_DIR=${COS_AURORA_PATCH_DIR}
+            -DCOS_AURORA_EXTRA_PATCH_DIR=${COS_AURORA_EXTRA_PATCH_DIR}
             -DCOS_AURORA_PATCH_HASH=${_cos_aurora_patch_hash}
             -P "${_cos_aurora_patch_script}"
         EXCLUDE_FROM_ALL)

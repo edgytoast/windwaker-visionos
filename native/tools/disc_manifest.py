@@ -144,6 +144,12 @@ DISC_CHECK_CACHE = os.path.join(BUILD, "runs", "disc_check.txt")
 # native/tools/run.sh have always checked; the image hash was taken from that same disc.
 EXPECTED_ISO_SHA1 = "0289e70f470dc758c73be9b8bcd8c865fb82d8ae"
 EXPECTED_DOL_SHA1 = "8d28bab68bb5078c38e43f29206f0bd01f7e7a67"
+# COS_DISC_ACCEPT_SHA1=<sha1>[,...]: other images of the same disc to accept, whose main.dol must
+# still match (Apple Vision Pro port, 2026-10-08: a Redump-verified dump converted from RVZ with
+# nodtool has another image hash than the copy above). The check stays exact: only the listed
+# images pass, and no further disc hash is kept in the repository.
+ACCEPTED_ISO_SHA1 = {EXPECTED_ISO_SHA1} | {
+    h.strip().lower() for h in os.environ.get("COS_DISC_ACCEPT_SHA1", "").split(",") if h.strip()}
 GC_MAGIC = b"\xC2\x33\x9F\x3D"
 
 # 2: "size" is always the stored size (a format's own size field moved to header_size).
@@ -245,11 +251,12 @@ def verify_disc(path, quiet=False):
         print("disc_manifest: %s: no such file" % path, file=sys.stderr)
         return False, None, None
     stamp = file_stamp(path)
-    line = "ok\t%s\t%s\t%s" % (path, stamp, EXPECTED_ISO_SHA1)
+    lines = {"ok\t%s\t%s\t%s" % (path, stamp, sha) for sha in ACCEPTED_ISO_SHA1}
     try:
         with open(DISC_CHECK_CACHE, encoding="utf-8") as c:
-            if line in c.read().splitlines():
-                return True, EXPECTED_ISO_SHA1, EXPECTED_DOL_SHA1
+            for cached in c.read().splitlines():
+                if cached in lines:
+                    return True, cached.rsplit("\t", 1)[1], EXPECTED_DOL_SHA1
     except OSError:
         pass
     if not quiet:
@@ -266,13 +273,13 @@ def verify_disc(path, quiet=False):
                   % (path, dsha, EXPECTED_DOL_SHA1), file=sys.stderr)
             return False, None, dsha
         isha = image_sha1(f)
-    if isha != EXPECTED_ISO_SHA1:
+    if isha not in ACCEPTED_ISO_SHA1:
         print("disc_manifest: %s: image SHA-1 %s, expected %s (the plain GZLE01 revision 0 .iso, "
               "decision H9)" % (path, isha, EXPECTED_ISO_SHA1), file=sys.stderr)
         return False, isha, dsha
     os.makedirs(os.path.dirname(DISC_CHECK_CACHE), exist_ok=True)
     with open(DISC_CHECK_CACHE, "a", encoding="utf-8") as c:
-        c.write(line + "\n")
+        c.write("ok\t%s\t%s\t%s\n" % (path, stamp, isha))
     return True, isha, dsha
 
 

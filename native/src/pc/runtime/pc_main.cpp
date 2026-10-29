@@ -77,6 +77,12 @@ void makeUserPaths(const char* argv0) {
 #if defined(__SWITCH__)
     (void)argv0;
     snprintf(sUserPath, sizeof(sUserPath), "%s/user", COS_SWITCH_ROOT);
+#elif defined(COS_VISIONOS)
+    // Apple Vision Pro: the app bundle is read-only; the host (visionos/host/game_host.mm) names a
+    // directory in the app's Documents, where the player sees the saves in Files.
+    (void)argv0;
+    const char* user = getenv("COS_USER_DIR");
+    snprintf(sUserPath, sizeof(sUserPath), "%s", user != nullptr && user[0] != '\0' ? user : ".");
 #else
     char exe[PATH_MAX] = {};
     executablePath(exe, sizeof(exe));

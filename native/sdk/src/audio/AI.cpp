@@ -77,6 +77,7 @@
 
 #include <pthread.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -140,6 +141,9 @@ HostThread sDmaThreadHost;
 
 SDL_AudioStream* sStream = nullptr;
 u32 sStreamHz = 0;
+// COSAISetPaused (cos_sdk/audio.h): the host's pause stops the engine (no DMA steps, so no DMA
+// callback and no audio frames for the game's sound threads) and the output device.
+std::atomic<bool> sPaused{false};
 FILE* sDump = nullptr;
 u32 sDumpHz = 0; // the rate in the dump's header (the DSP rate when the dump was opened)
 u32 sDumpFrames = 0;
@@ -307,6 +311,7 @@ void* DmaThreadMain(void*) {
     using Clock = std::chrono::steady_clock;
     auto base = Clock::now();
     u64 played = 0; // frames since `base`
+    bool outputPaused = false;
     std::vector<s16> frames;
     for (;;) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -327,6 +332,30 @@ void* DmaThreadMain(void*) {
         }
         if (reopenDump) {
             OpenDump(newDump, rate);
+        }
+        const bool paused = sPaused.load(std::memory_order_acquire);
+        if (paused != outputPaused) {
+            outputPaused = paused;
+            if (sStream != nullptr) {
+                if (paused) {
+                    SDL_PauseAudioStreamDevice(sStream);
+                } else {
+                    SDL_ResumeAudioStreamDevice(sStream);
+                }
+            }
+            u64 playedSoFar;
+            {
+                std::lock_guard<std::mutex> os(Lock());
+                playedSoFar = sAI.outFrames;
+            }
+            // Resumed: the clock starts again from now, so nothing missed is played or skipped.
+            base = Clock::now();
+            played = 0;
+            Log("AI: %s, %llu frames played so far", paused ? "paused" : "resumed",
+                static_cast<unsigned long long>(playedSoFar));
+        }
+        if (paused) {
+            continue;
         }
         const auto now = Clock::now();
         if (rate != hz) {
@@ -562,6 +591,10 @@ void COSAIGetOutputStats(u64* frames, u64* sumSquares) {
     Guard guard;
     *frames = sAI.outFrames;
     *sumSquares = sAI.outSumSquares;
+}
+
+void COSAISetPaused(bool paused) {
+    sPaused.store(paused, std::memory_order_release);
 }
 
 void AIReset(void) {

@@ -48,6 +48,11 @@ struct mDoLib_clipper {
 };
 
 void mDoLib_project(Vec* src, Vec* dst);
+#if COS_VISIONOS
+// A place mDoLib_project gave (in the picture) at the drawn frame's, for a depth peek there: the
+// Window view in 3D draws wider than its picture (visionos/host/wwvr_window.h).
+void mDoLib_pictureToDrawn(f32* x, f32* y);
+#endif
 u32 mDoLib_setResTimgObj(ResTIMG* res, GXTexObj* o_texObj, u32 tlut_name, GXTlutObj* o_tlutObj);
 void mDoLib_pos2camera(Vec* src, Vec* dst);
 u32 mDoLib_cnvind32(u32 r3);

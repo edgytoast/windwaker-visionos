@@ -1,0 +1,871 @@
+diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
+index 972b4b7..1fc36ef 100644
+--- a/lib/gx/command_processor.cpp
++++ b/lib/gx/command_processor.cpp
+@@ -630,7 +630,7 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader&
+       }
+     gfx::detail::increment_merged_draw_count();
+     if (mirror::recording()) {
+-      mirror::record(prim, sDrawCache.config.shaderConfig, vtxCount, vertexData.data(), nullptr, 0);
++      mirror::record(prim, sDrawCache.config.shaderConfig, vtxCount, vertexData.data(), nullptr, 0, true);
+     }
+     return;
+   }
+diff --git a/lib/gx/fifo.cpp b/lib/gx/fifo.cpp
+index bcaba60..8d897ed 100644
+--- a/lib/gx/fifo.cpp
++++ b/lib/gx/fifo.cpp
+@@ -5,12 +5,19 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <mutex>
+ 
+ #include <tracy/Tracy.hpp>
+ 
++#if defined(__APPLE__)
++#include <os/os_sync_wait_on_address.h>
++#include <sched.h>
++#include <time.h>
++#endif
++
+ namespace aurora::gx::fifo {
+ namespace detail {
+ uint8_t* sBufferData = nullptr;
+@@ -37,6 +44,26 @@ std::atomic<uint32_t> sWorkerWake{0};
+ thread::Thread sWorkerThread;
+ std::atomic<DrawDoneCallback> sDrawDoneCallback{nullptr};
+ 
++#if defined(__APPLE__)
++// visionos/patches/aurora/0106: the worker and drain() wait in the kernel. visionOS's libc++ has
++// no native atomic wait (its notify is a no-op and its wait polls, sleeping half as long as it has
++// waited so far: up to 64 ms at a time, 8 ms once it has waited 128 ms; libc++'s
++// __libcpp_timed_backoff_policy), so a drain woke late by up to half its wait, and the
++// worker, idle while the game ran its logic, took up to milliseconds to see the next draw. Each
++// side spins briefly first (draws come every few microseconds while the game draws), then sleeps
++// on the address (os_sync_wait_on_address); the other wakes it only when it says it's asleep.
++std::atomic<uint32_t> sWorkerSleeping{0};
++std::atomic<uint32_t> sDrainSleeping{0};
++constexpr uint64_t kSpinNanos = 50'000;
++
++uint64_t now_nanos() noexcept { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
++// A test switch: AURORA_FIFO_KERNEL_WAIT=0 waits as before (std::atomic's wait), to compare.
++const bool kKernelWait = [] {
++  const char* value = std::getenv("AURORA_FIFO_KERNEL_WAIT");
++  return value == nullptr || std::strcmp(value, "0") != 0;
++}();
++#endif
++
+ void dispatch_draw_done() noexcept {
+   if (const auto callback = sDrawDoneCallback.load(std::memory_order_acquire); callback != nullptr) {
+     callback();
+@@ -44,6 +71,15 @@ void dispatch_draw_done() noexcept {
+ }
+ 
+ void wake_worker() noexcept {
++#if defined(__APPLE__)
++  if (kKernelWait) {
++    sWorkerWake.fetch_add(1, std::memory_order_seq_cst);
++    if (sWorkerSleeping.load(std::memory_order_seq_cst) != 0) {
++      os_sync_wake_by_address_any(&sWorkerWake, sizeof(uint32_t), OS_SYNC_WAKE_BY_ADDRESS_NONE);
++    }
++    return;
++  }
++#endif
+   sWorkerWake.fetch_add(1, std::memory_order_release);
+   sWorkerWake.notify_all();
+ }
+@@ -68,6 +104,15 @@ void process_to(uint64_t target, std::memory_order order) noexcept {
+       dispatch_draw_done();
+     }
+     processed += result.bytesProcessed;
++#if defined(__APPLE__)
++    if (kKernelWait) {
++      sProcessed.store(processed, std::memory_order_seq_cst);
++      if (sDrainSleeping.load(std::memory_order_seq_cst) != 0) {
++        os_sync_wake_by_address_all(&sProcessed, sizeof(uint64_t), OS_SYNC_WAKE_BY_ADDRESS_NONE);
++      }
++      continue;
++    }
++#endif
+     sProcessed.store(processed, order);
+     sProcessed.notify_all();
+   }
+@@ -87,7 +132,33 @@ void worker_main(std::stop_token token) noexcept {
+     if (token.stop_requested()) {
+       break;
+     }
++#if defined(__APPLE__)
++    if (!kKernelWait) {
++      sWorkerWake.wait(event, std::memory_order_acquire);
++      continue;
++    }
++    // A moment's spin (the next draw is usually microseconds away), then asleep until woken.
++    const uint64_t spinUntil = now_nanos() + kSpinNanos;
++    bool more = false;
++    while (now_nanos() < spinUntil) {
++      if (sPublished.load(std::memory_order_acquire) != processed || token.stop_requested()) {
++        more = true;
++        break;
++      }
++      sched_yield();
++    }
++    if (more) {
++      continue;
++    }
++    sWorkerSleeping.store(1, std::memory_order_seq_cst);
++    if (sWorkerWake.load(std::memory_order_seq_cst) == event &&
++        sPublished.load(std::memory_order_seq_cst) == processed && !token.stop_requested()) {
++      os_sync_wait_on_address(&sWorkerWake, event, sizeof(uint32_t), OS_SYNC_WAIT_ON_ADDRESS_NONE);
++    }
++    sWorkerSleeping.store(0, std::memory_order_seq_cst);
++#else
+     sWorkerWake.wait(event, std::memory_order_acquire);
++#endif
+   }
+ }
+ 
+@@ -250,6 +321,22 @@ void drain() {
+     wake_worker();
+ 
+     uint64_t processed = sProcessed.load(std::memory_order_acquire);
++#if defined(__APPLE__)
++    if (processed < target && kKernelWait) {
++      const uint64_t spinUntil = now_nanos() + kSpinNanos;
++      while (processed < target && now_nanos() < spinUntil) {
++        sched_yield();
++        processed = sProcessed.load(std::memory_order_acquire);
++      }
++      if (processed < target) {
++        sDrainSleeping.store(1, std::memory_order_seq_cst);
++        while ((processed = sProcessed.load(std::memory_order_seq_cst)) < target) {
++          os_sync_wait_on_address(&sProcessed, processed, sizeof(uint64_t), OS_SYNC_WAIT_ON_ADDRESS_NONE);
++        }
++        sDrainSleeping.store(0, std::memory_order_seq_cst);
++      }
++    }
++#endif
+     if (processed < target) {
+       do {
+         sProcessed.wait(processed, std::memory_order_acquire);
+diff --git a/lib/gx/mirror.cpp b/lib/gx/mirror.cpp
+index acbdef2..5989966 100644
+--- a/lib/gx/mirror.cpp
++++ b/lib/gx/mirror.cpp
+@@ -29,6 +29,8 @@
+ #include "shader_info.hpp"
+ #include "texture.hpp"
+ 
++#include <absl/container/flat_hash_map.h>
++
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
+@@ -38,6 +40,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <ctime>
+ #include <deque>
+ #include <string>
+ #include <memory>
+@@ -48,6 +51,7 @@
+ 
+ #if defined(__APPLE__)
+ #include <dispatch/dispatch.h>
++#include <pthread/qos.h>
+ #endif
+ 
+ namespace aurora::gx::mirror {
+@@ -398,7 +402,7 @@ struct Built {
+ };
+ 
+ struct Stats {
+-  uint64_t draws = 0, recorded = 0, lines = 0, screen = 0, noColour = 0, viewport = 0, projection = 0, blend = 0,
++  uint64_t draws = 0, recorded = 0, merged = 0, lines = 0, screen = 0, noColour = 0, viewport = 0, projection = 0, blend = 0,
+            copyOnly = 0, alphaNever = 0, vertices = 0, triangles = 0, background = 0, behind = 0, frames = 0;
+   double seconds = 0;
+ };
+@@ -416,6 +420,15 @@ float g_farthest = 0, g_nearestBackground = INFINITY;
+ std::vector<std::pair<uint32_t, uint32_t>> g_backgroundRanges;
+ std::vector<std::pair<uint32_t, uint32_t>> g_decalRanges; // lifted in finish, once depths are final
+ std::vector<Group> g_groups;
++// 0106: index lists of earlier frames' groups, emptied but keeping their room, for this frame's
++// (made and freed each frame, a busy frame's large lists went back to the system and were asked
++// for again, every frame). Only modest ones, up to 16 MB in all: a list keeps the room it grew to,
++// and the near subdivision's big lists, passed from group to group, would otherwise all end up as
++// big as the biggest and stay so.
++std::vector<std::vector<uint32_t>> g_spareIndices;
++size_t g_spareBytes = 0;
++constexpr size_t kSpareListMax = size_t{1} << 16; // indices
++constexpr size_t kSpareBytesMax = size_t{16} << 20;
+ std::unordered_map<uint64_t, size_t> g_solidGroups;
+ int g_lastBlended = -1;
+ Built g_building;
+@@ -662,7 +675,9 @@ struct LookupPixels {
+   std::vector<uint8_t> rgba;
+   uint32_t width = 0, height = 0;
+ };
+-std::unordered_map<uint64_t, std::shared_ptr<const LookupPixels>> g_lookupPixels; // FIFO thread
++// (0106: owned here, read by the frame's jobs through plain pointers; let go of only between frames,
++// in sweep_textures and forget_textures, when no job is in flight.)
++std::unordered_map<uint64_t, std::unique_ptr<LookupPixels>> g_lookupPixels; // FIFO thread
+ constexpr uint32_t kLookupMaxTexels = 256 * 256;
+ 
+ // 0105: two textures a draw multiplies (an eye: its white and pupil, scrolled by a texture matrix, times
+@@ -694,6 +709,10 @@ void forget_textures() {
+ 
+ // Every few seconds: textures unused for fifteen go. (`all`: every one, for test runs.)
+ void sweep_textures(bool all = false) {
++  // Lookups' pixels: a few hundred at most (between frames: no job reads them now).
++  if (g_lookupPixels.size() > 512) {
++    g_lookupPixels.clear();
++  }
+   // Ids kept for textures that never came back (memory a level freed, reused): a long session's worth
+   // at most.
+   if (g_retiredTextures.size() > 65536 || g_retiredVariants.size() > 65536) {
+@@ -732,25 +751,21 @@ void sweep_textures(bool all = false) {
+ }
+ 
+ // A lookup's pixels (decoded once, then kept), or null for one too big to read on the CPU.
+-std::shared_ptr<const LookupPixels> lookup_pixels(const TexEntry& entry, const GXTexObj_& obj) {
++const LookupPixels* lookup_pixels(const TexEntry& entry, const GXTexObj_& obj) {
+   if (!entry.ok || entry.captured || obj.width() * obj.height() > kLookupMaxTexels) {
+     return nullptr;
+   }
+   if (auto found = g_lookupPixels.find(entry.id); found != g_lookupPixels.end()) {
+-    return found->second;
++    return found->second.get();
+   }
+-  auto pixels = std::make_shared<LookupPixels>();
++  auto pixels = std::make_unique<LookupPixels>();
+   pixels->rgba = decode(obj, palette_of(obj));
+   pixels->width = obj.width();
+   pixels->height = obj.height();
+   if (pixels->rgba.size() < static_cast<size_t>(pixels->width) * pixels->height * 4) {
+     return nullptr;
+   }
+-  if (g_lookupPixels.size() >= 512) {
+-    g_lookupPixels.clear(); // (jobs in flight hold their own references)
+-  }
+-  g_lookupPixels.emplace(entry.id, pixels);
+-  return pixels;
++  return g_lookupPixels.emplace(entry.id, std::move(pixels)).first->second.get();
+ }
+ 
+ // GX's wrap of texel index i in n texels.
+@@ -804,6 +819,17 @@ uint32_t read32(const uint8_t* p, bool le) {
+             : (static_cast<uint32_t>(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]);
+ }
+ 
++// 0106: a monotonic clock in nanoseconds that doesn't cost a system call (the recording timed each
++// of a frame's thousands of draws with steady_clock, whose clock_gettime did).
++uint64_t clock_ns() {
++#if defined(__APPLE__)
++  return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++#else
++  return static_cast<uint64_t>(
++      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
++#endif
++}
++
+ // What a draw's vertices read of the GX state, copied when the draw is recorded: the vertices are
+ // decoded on worker threads while the FIFO thread moves on.
+ struct DrawState {
+@@ -819,19 +845,57 @@ struct DrawState {
+   Mat4x4<float> proj;
+   u32 currentPnMtx = 0;
+ 
+-  void capture() {
++  // 0106: only what this draw's vertices read (a frame has thousands of draws, and copying all of
++  // it each time was a good part of recording one): the current matrix unless the vertices or their
++  // texture coordinates pick others, the texture matrices and lights only if used, and the arrays
++  // of the indexed attributes. What isn't copied isn't read (decode_vertex, tex_coord, light).
++  void capture(const ShaderConfig& config) {
+     const auto& st = g_gxState;
+-    pnMtx = st.pnMtx;
+-    texMtxs = st.texMtxs;
+-    ptTexMtxs = st.ptTexMtxs;
+-    lights = st.lights;
++    currentPnMtx = st.currentPnMtx;
++    bool allPn = config.attrs[GX_VA_PNMTXIDX].attrType != GX_NONE;
++    bool texMtx = false, postMtx = false;
++    for (u32 i = 0; i < MaxTexCoord; ++i) {
++      const TcgConfig& tcg = config.tcgs[i];
++      if (config.attrs[GX_VA_TEX0MTXIDX + i].attrType != GX_NONE) {
++        allPn = true;
++        texMtx = true;
++      }
++      if (tcg.src == GX_MAX_TEXGENSRC) {
++        continue;
++      }
++      if (tcg.mtx != GX_IDENTITY) {
++        (tcg.mtx < GX_TEXMTX0 ? allPn : texMtx) = true;
++      }
++      postMtx = postMtx || tcg.postMtx != GX_PTIDENTITY;
++    }
++    if (allPn) {
++      pnMtx = st.pnMtx;
++    } else {
++      const u32 current = std::min<u32>(currentPnMtx, MaxPnMtx - 1);
++      pnMtx[current] = st.pnMtx[current];
++    }
++    if (texMtx) {
++      texMtxs = st.texMtxs;
++    }
++    if (postMtx) {
++      ptTexMtxs = st.ptTexMtxs;
++    }
+     channelConfig = st.colorChannelConfig;
+     channelState = st.colorChannelState;
++    for (const auto& channel : channelConfig) {
++      if (channel.lightingEnabled) {
++        lights = st.lights;
++        break;
++      }
++    }
+     colorRegs = st.colorRegs;
+-    arrays = st.arrays;
++    for (u32 a = 0; a < MaxVtxAttr; ++a) {
++      if (config.attrs[a].attrType == GX_INDEX8 || config.attrs[a].attrType == GX_INDEX16) {
++        arrays[a] = st.arrays[a];
++      }
++    }
+     fog = st.fog;
+     proj = st.proj;
+-    currentPnMtx = st.currentPnMtx;
+   }
+ };
+ 
+@@ -1329,7 +1393,7 @@ struct DrawPlan {
+   std::array<std::array<float, 4>, MaxTevStages> konst{};
+   // 0104: textures read per vertex (lookups, by map), the coordinate each is read with, its wraps.
+   struct Lookup {
+-    std::shared_ptr<const LookupPixels> pixels;
++    const LookupPixels* pixels = nullptr;
+     int coord = -1;
+     uint8_t wrapS = 0, wrapT = 0;
+   };
+@@ -1635,6 +1699,16 @@ uint64_t part_key(const MirrorPart& part) {
+   return xxh3_hash_s(&key, sizeof key);
+ }
+ 
++std::vector<uint32_t> take_spare_indices() {
++  if (g_spareIndices.empty()) {
++    return {};
++  }
++  std::vector<uint32_t> indices = std::move(g_spareIndices.back());
++  g_spareIndices.pop_back();
++  g_spareBytes -= indices.capacity() * sizeof(uint32_t);
++  return indices;
++}
++
+ Group& group_for(const MirrorPart& part) {
+   const uint64_t key = part_key(part);
+   if (part.kind != aurora::mirror::PartBlend) {
+@@ -1642,7 +1716,7 @@ Group& group_for(const MirrorPart& part) {
+       return g_groups[found->second];
+     }
+     g_solidGroups.emplace(key, g_groups.size());
+-    g_groups.push_back({key, part, {}, false});
++    g_groups.push_back({key, part, take_spare_indices(), false});
+     return g_groups.back();
+   }
+   // Blended draws keep the game's order: a run of one material is one group.
+@@ -1650,7 +1724,7 @@ Group& group_for(const MirrorPart& part) {
+     return g_groups[g_lastBlended];
+   }
+   g_lastBlended = static_cast<int>(g_groups.size());
+-  g_groups.push_back({key, part, {}, true});
++  g_groups.push_back({key, part, take_spare_indices(), true});
+   return g_groups.back();
+ }
+ 
+@@ -1783,6 +1857,13 @@ struct DrawJob {
+   // a bake of the TEV's whole result (its colour and alpha as they are).
+   float pull = 0.f;
+   bool baked = false;
++  // 0106: draws the command processor merged into this one (no GX state changed between them): each
++  // primitive's first vertex and count in `bytes`. Empty: one primitive, `prim`, of every vertex.
++  struct Segment {
++    GXPrimitive prim;
++    uint32_t first, count;
++  };
++  std::vector<Segment> segments;
+   // Out: its vertices (clipping adds some) and triangles into them, wound for RealityKit.
+   std::vector<MirrorVertex> vertices;
+   std::vector<uint32_t> triangles;
+@@ -1792,8 +1873,22 @@ struct DrawJob {
+ std::vector<std::unique_ptr<DrawJob>> g_jobs;
+ size_t g_jobCount = 0;
+ // How many times this frame each (mesh, place) has been drawn.
+-std::unordered_map<uint64_t, unsigned> g_passes;
++absl::flat_hash_map<uint64_t, unsigned> g_passes; // (0106: a flat map, given last frame's room)
+ std::atomic<uint64_t> g_decodeNanos{0};
++// The FIFO thread's CPU time over each scene (BEGIN to END: the command processor's own work and
++// the mirror's recording and merging), and the finishing worker's: thread CPU time, which leaves
++// out what other processes take of the cores (a Simulator on a busy Mac).
++uint64_t thread_cpu_ns() {
++#if defined(__APPLE__)
++  return clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
++#else
++  struct timespec ts {};
++  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
++  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
++#endif
++}
++std::atomic<uint64_t> g_sceneCpuNanos{0}, g_finishCpuNanos{0}, g_scenes{0};
++uint64_t g_sceneCpuStart = 0;
+ #if defined(__APPLE__)
+ dispatch_group_t g_jobGroup = dispatch_group_create();
+ #endif
+@@ -2130,26 +2225,38 @@ void build_triangles(DrawJob& job) {
+     for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+       triangle(indices[i], indices[i + 1], indices[i + 2]);
+     }
+-  } else if (job.prim == GX_TRIANGLES) {
+-    for (uint32_t i = 0; i + 2 < vtxCount; i += 3) {
+-      triangle(i, i + 1, i + 2);
+-    }
+-  } else if (job.prim == GX_QUADS) {
+-    for (uint32_t i = 0; i + 3 < vtxCount; i += 4) {
+-      triangle(i, i + 1, i + 2);
+-      triangle(i + 2, i + 3, i);
+-    }
+-  } else if (job.prim == GX_TRIANGLESTRIP) {
+-    for (uint32_t i = 2; i < vtxCount; ++i) {
+-      if (i == 2 || (i & 1) == 0) {
+-        triangle(i - 2, i - 1, i);
+-      } else {
+-        triangle(i - 1, i - 2, i);
++    return;
++  }
++  // Each primitive (one, or the merged draws' in turn) from its own first vertex.
++  const auto primitive = [&](GXPrimitive prim, uint32_t o, uint32_t n) {
++    if (prim == GX_TRIANGLES) {
++      for (uint32_t i = 0; i + 2 < n; i += 3) {
++        triangle(o + i, o + i + 1, o + i + 2);
++      }
++    } else if (prim == GX_QUADS) {
++      for (uint32_t i = 0; i + 3 < n; i += 4) {
++        triangle(o + i, o + i + 1, o + i + 2);
++        triangle(o + i + 2, o + i + 3, o + i);
++      }
++    } else if (prim == GX_TRIANGLESTRIP) {
++      for (uint32_t i = 2; i < n; ++i) {
++        if (i == 2 || (i & 1) == 0) {
++          triangle(o + i - 2, o + i - 1, o + i);
++        } else {
++          triangle(o + i - 1, o + i - 2, o + i);
++        }
++      }
++    } else if (prim == GX_TRIANGLEFAN) {
++      for (uint32_t i = 2; i < n; ++i) {
++        triangle(o, o + i - 1, o + i);
+       }
+     }
+-  } else if (job.prim == GX_TRIANGLEFAN) {
+-    for (uint32_t i = 2; i < vtxCount; ++i) {
+-      triangle(0, i - 1, i);
++  };
++  if (job.segments.empty()) {
++    primitive(job.prim, 0, vtxCount);
++  } else {
++    for (const auto& segment : job.segments) {
++      primitive(segment.prim, segment.first, std::min(segment.count, vtxCount - std::min(segment.first, vtxCount)));
+     }
+   }
+ }
+@@ -2173,7 +2280,7 @@ bool runaway(const float position[3]) {
+ }
+ 
+ void process(DrawJob& job) {
+-  const auto started = std::chrono::steady_clock::now();
++  const uint64_t started = clock_ns();
+   const Decoder decoder{job.state, job.config, job.bytes.data(), job.bytes.size()};
+   job.vertices.resize(job.vtxCount);
+   job.triangles.clear();
+@@ -2188,16 +2295,96 @@ void process(DrawJob& job) {
+     job.farthest = std::max(job.farthest, distance);
+   }
+   build_triangles(job);
+-  g_decodeNanos += static_cast<uint64_t>(
+-      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
++  g_decodeNanos += clock_ns() - started;
+ }
+ 
+-// END: every draw decoded, merged in the game's order into the frame.
+-void merge_jobs() {
+ #if defined(__APPLE__)
++// 0106: draws go to the workers in batches of up to 256 (or 8,192 vertices): a frame has thousands,
++// most of a few vertices, and a dispatch each (which woke a worker each time) cost the FIFO thread
++// more than recording them. Batches are kept from frame to frame; reused once the group is done.
++// The last draw recorded is held back (g_openJob) until the next is, as merged draws join it.
++struct Batch {
++  std::array<DrawJob*, 256> jobs{};
++  uint32_t count = 0;
++};
++std::vector<std::unique_ptr<Batch>> g_batches;
++size_t g_batchCount = 0;
++Batch* g_openBatch = nullptr;
++uint32_t g_openVertices = 0;
++
++void flush_batch() {
++  if (g_openBatch == nullptr) {
++    return;
++  }
++  if (g_openBatch->count > 0) {
++    dispatch_group_async_f(g_jobGroup, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), g_openBatch,
++                           [](void* context) {
++                             auto* batch = static_cast<Batch*>(context);
++                             for (uint32_t i = 0; i < batch->count; ++i) {
++                               process(*batch->jobs[i]);
++                             }
++                           });
++  }
++  g_openBatch = nullptr;
++  g_openVertices = 0;
++}
++
++void queue_job(DrawJob& job) {
++  if (g_openBatch == nullptr) {
++    if (g_batchCount == g_batches.size()) {
++      g_batches.push_back(std::make_unique<Batch>());
++    }
++    g_openBatch = g_batches[g_batchCount++].get();
++    g_openBatch->count = 0;
++  }
++  g_openBatch->jobs[g_openBatch->count++] = &job;
++  g_openVertices += job.vtxCount;
++  if (g_openBatch->count == g_openBatch->jobs.size() || g_openVertices >= 8192) {
++    flush_batch();
++  }
++}
++
++DrawJob* g_openJob = nullptr;   // recorded, not yet queued: merged draws join it
++DrawJob* g_mergeTarget = nullptr; // the last draw's job, if it was recorded (and can take more)
++bool g_lastLeftOut = false;       // the last draw was left out (so are draws merged into it)
++
++void queue_open_job() {
++  if (g_openJob != nullptr) {
++    queue_job(*g_openJob);
++    g_openJob = nullptr;
++  }
++}
++
++// Every batch dispatched, and done.
++void wait_jobs() {
++  g_mergeTarget = nullptr;
++  g_lastLeftOut = false;
++  queue_open_job();
++  flush_batch();
+   dispatch_group_wait(g_jobGroup, DISPATCH_TIME_FOREVER);
++  g_batchCount = 0;
++}
++#else
++DrawJob* g_openJob = nullptr;
++DrawJob* g_mergeTarget = nullptr;
++bool g_lastLeftOut = false;
++void queue_open_job() {
++  if (g_openJob != nullptr) {
++    process(*g_openJob);
++    g_openJob = nullptr;
++  }
++}
++void wait_jobs() {
++  g_mergeTarget = nullptr;
++  g_lastLeftOut = false;
++  queue_open_job();
++}
+ #endif
+-  std::vector<uint8_t> sane;
++
++// END: every draw decoded, merged in the game's order into the frame.
++void merge_jobs() {
++  wait_jobs();
++  static std::vector<uint8_t> sane; // FIFO thread: kept, not made again each frame
+   for (size_t i = 0; i < g_jobCount; ++i) {
+     DrawJob& job = *g_jobs[i];
+     const auto base = static_cast<uint32_t>(g_building.vertices.size());
+@@ -2217,7 +2404,12 @@ void merge_jobs() {
+       g_decalRanges.emplace_back(base, static_cast<uint32_t>(g_building.vertices.size()));
+     }
+     auto& indices = g_groups[job.group].indices;
+-    indices.reserve(indices.size() + job.triangles.size());
++    // 0106: room grown geometrically. Reserved to the exact size for each draw, a material drawn in
++    // thousands of draws (the sea at the title, grass) moved its whole index list each time: the
++    // FIFO thread spent most of a title frame (four frames a second) copying and freeing it.
++    if (const size_t needed = indices.size() + job.triangles.size(); needed > indices.capacity()) {
++      indices.reserve(std::max(needed, indices.capacity() * 2));
++    }
+     const size_t before = indices.size();
+     for (size_t t = 0; t + 2 < job.triangles.size(); t += 3) {
+       const uint32_t a = job.triangles[t], b = job.triangles[t + 1], c = job.triangles[t + 2];
+@@ -2240,9 +2432,7 @@ void merge_jobs() {
+ }
+ 
+ void discard_jobs() {
+-#if defined(__APPLE__)
+-  dispatch_group_wait(g_jobGroup, DISPATCH_TIME_FOREVER);
+-#endif
++  wait_jobs();
+   g_jobCount = 0;
+ }
+ 
+@@ -2426,8 +2616,19 @@ void log_skipped(const ShaderConfig& config, const MirrorPart& part, u16 vtxCoun
+ 
+ void begin_frame() {
+   g_bakeOccurrences.clear();
++  const size_t passes = g_passes.size();
+   g_passes.clear();
++  g_passes.reserve(passes);
+   g_building.vertices.clear();
++  for (Group& group : g_groups) {
++    const size_t bytes = group.indices.capacity() * sizeof(uint32_t);
++    if (group.indices.capacity() > 0 && group.indices.capacity() <= kSpareListMax &&
++        g_spareBytes + bytes <= kSpareBytesMax) {
++      group.indices.clear();
++      g_spareBytes += bytes;
++      g_spareIndices.push_back(std::move(group.indices));
++    }
++  }
+   g_groups.clear();
+   g_solidGroups.clear();
+   g_lastBlended = -1;
+@@ -2475,7 +2676,13 @@ struct Easing {
+ void subdivide_near(std::vector<MirrorVertex>& vertices, std::vector<Group>& groups, float plane,
+                     std::vector<uint8_t>& marks, const Easing* easing = nullptr) {
+   const size_t budget = vertices.size() + 400000;
+-  std::unordered_map<uint64_t, uint32_t> midpoints;
++  // 0106: a flat map, kept from frame to frame (the worker's own): a node map made afresh each
++  // frame took most of a close-up frame's finishing (Link's house: about 25 ms in the Simulator).
++  // Emptied by erasing (clear() gives a big table's room back) and given room for lately's need.
++  static thread_local absl::flat_hash_map<uint64_t, uint32_t> midpoints;
++  static thread_local size_t recent = 0; // midpoints lately: room made for them up front
++  midpoints.erase(midpoints.begin(), midpoints.end());
++  midpoints.reserve(recent);
+   const auto depth = [&](uint32_t i) { return -vertices[i].position[2]; };
+   const auto splits = [&](uint32_t i, uint32_t j) {
+     const float a = depth(i), b = depth(j), near = std::min(a, b), far = std::max(a, b);
+@@ -2521,7 +2728,7 @@ void subdivide_near(std::vector<MirrorVertex>& vertices, std::vector<Group>& gro
+     midpoints.emplace(key, index);
+     return index;
+   };
+-  std::vector<uint32_t> out;
++  static thread_local std::vector<uint32_t> out;
+   // Children keep their parent's winding.
+   const auto emit = [&](auto& self, uint32_t v0, uint32_t v1, uint32_t v2, int level) -> void {
+     const bool s01 = level < 24 && splits(v0, v1), s12 = level < 24 && splits(v1, v2), s20 = level < 24 && splits(v2, v0);
+@@ -2579,6 +2786,7 @@ void subdivide_near(std::vector<MirrorVertex>& vertices, std::vector<Group>& gro
+     }
+     group.indices.swap(out);
+   }
++  recent = std::max(recent - recent / 8, midpoints.size());
+ }
+ 
+ // --- Finishing a frame: on a worker of its own, so neither the FIFO thread nor the game thread
+@@ -2769,6 +2977,12 @@ void finish(Job& job) {
+ }
+ 
+ void worker_main() {
++#if defined(__APPLE__)
++  // 0106: as urgent as the decoding workers (user-interactive): at the default, it lost the cores to
++  // them and the game's threads, and took 30 ms of wall time for 3 ms of work at sea, dropping a
++  // mirror frame in three.
++  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++#endif
+   Job work;
+   while (true) {
+     {
+@@ -2778,7 +2992,9 @@ void worker_main() {
+       g_jobPending = false;
+     }
+     const auto started = std::chrono::steady_clock::now();
++    const uint64_t finishCpu = thread_cpu_ns();
+     finish(work);
++    g_finishCpuNanos += thread_cpu_ns() - finishCpu;
+     g_finishNanos += static_cast<uint64_t>(
+         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+     ++g_finished;
+@@ -2837,16 +3053,22 @@ void publish(bool scene, float focus) {
+   if (g_stats.frames == 600) {
+     const double f = static_cast<double>(g_stats.frames);
+     const uint64_t finished = std::max<uint64_t>(g_finished.exchange(0), 1);
+-    Log.info("mirror: per frame {:.0f} draws, {:.0f} recorded ({:.0f} background), skipped {:.0f} lines, {:.0f} screen, "
++    Log.info("mirror: per frame {:.0f} draws, {:.0f} recorded ({:.0f} merged, {:.0f} background), skipped {:.0f} lines, {:.0f} screen, "
+              "{:.0f} no colour, {:.0f} small viewport, {:.0f} other projection, {:.0f} blend, {:.0f} framebuffer "
+              "copies, {:.0f} alpha-never; {:.0f} see-through (refracting); {:.0f} vertices, {:.0f} triangles, {} parts; "
+              "recording {:.2f} ms (FIFO thread), decoding {:.2f} ms (workers' CPU), finishing {:.2f} ms (worker), {} "
+              "frames dropped; {} textures known",
+-             g_stats.draws / f, g_stats.recorded / f, g_stats.background / f, g_stats.lines / f, g_stats.screen / f,
++             g_stats.draws / f, g_stats.recorded / f, g_stats.merged / f, g_stats.background / f, g_stats.lines / f, g_stats.screen / f,
+              g_stats.noColour / f, g_stats.viewport / f, g_stats.projection / f, g_stats.blend / f, g_stats.copyOnly / f,
+              g_stats.alphaNever / f, g_stats.behind / f, g_stats.vertices / f, g_stats.triangles / f,
+              g_lastParts.load(), g_stats.seconds / f * 1000.0, static_cast<double>(g_decodeNanos.exchange(0)) / f / 1e6,
+              static_cast<double>(g_finishNanos.exchange(0)) / finished / 1e6, g_dropped.exchange(0), g_textures.size());
++    {
++      const double scenes = static_cast<double>(std::max<uint64_t>(g_scenes.exchange(0), 1));
++      Log.info("mirror: CPU per frame: FIFO thread over the scene {:.2f} ms, finishing {:.2f} ms",
++               static_cast<double>(g_sceneCpuNanos.exchange(0)) / scenes / 1e6,
++               static_cast<double>(g_finishCpuNanos.exchange(0)) / finished / 1e6);
++    }
+     log_tally(f);
+     Log.info("mirror: glass at {:.0f} (focus {:.0f}), {:.1f}% of vertices moved nearer it (into its band, or "
+              "easing into {:.2f} window widths in front; clipped ones counted too)",
+@@ -2863,6 +3085,7 @@ void mark(u32 mark, f32 value) noexcept {
+     discard_jobs(); // a frame that never ended
+     g_frameTag = static_cast<uint32_t>(std::max(value, 0.f)) & 0xFFFFFFu;
+     g_recording = g_enabled.load(std::memory_order_relaxed);
++    g_sceneCpuStart = thread_cpu_ns();
+     if (g_reset.exchange(false)) {
+       forget_textures();
+     }
+@@ -2880,6 +3103,8 @@ void mark(u32 mark, f32 value) noexcept {
+       discard_jobs();
+     }
+     publish(mark == AURORA_MIRROR_MARK_END, value);
++    g_sceneCpuNanos += thread_cpu_ns() - g_sceneCpuStart;
++    ++g_scenes;
+   }
+ }
+ 
+@@ -3088,16 +3313,42 @@ bool bake_pair(DrawJob& job, MirrorPart& part) {
+ }
+ 
+ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8* vertices, const u16* indices,
+-            u32 indexCount) noexcept {
++            u32 indexCount, bool merged) noexcept {
+   if (!g_recording || g_offscreen > 0 || vtxCount == 0) {
+     tally(g_offscreen > 0 ? TallyOffscreen : TallyOutside);
++    g_mergeTarget = nullptr;
++    g_lastLeftOut = false;
+     return;
+   }
+-  const auto started = std::chrono::steady_clock::now();
++  // 0106: a draw the command processor merged into the last (no GX state changed between them)
++  // joins the last's job, or is left out as it was: its state, material and plan are the same.
++  if (merged && indices == nullptr) {
++    if (g_mergeTarget != nullptr) {
++      DrawJob& job = *g_mergeTarget;
++      if (job.segments.empty()) {
++        job.segments.push_back({job.prim, 0, job.vtxCount});
++      }
++      job.segments.push_back({prim, job.vtxCount, vtxCount});
++      job.bytes.insert(job.bytes.end(), vertices, vertices + static_cast<size_t>(vtxCount) * config.vtxStride);
++      job.vtxCount += vtxCount;
++      ++g_stats.draws;
++      ++g_stats.recorded;
++      ++g_stats.merged;
++      g_stats.vertices += vtxCount;
++      return;
++    }
++    if (g_lastLeftOut) {
++      ++g_stats.draws;
++      ++g_stats.merged;
++      return;
++    }
++  }
++  g_mergeTarget = nullptr;
++  g_lastLeftOut = true; // until its job is made, below
+   struct Timer {
+-    std::chrono::steady_clock::time_point started;
+-    ~Timer() { g_stats.seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(); }
+-  } timer{started};
++    uint64_t started = clock_ns();
++    ~Timer() { g_stats.seconds += static_cast<double>(clock_ns() - started) * 1e-9; }
++  } timer;
+   const auto& st = g_gxState;
+   ++g_stats.draws;
+   if (config.lineMode != 0) {
+@@ -3154,7 +3405,14 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+     part.opacityAlpha = 1.f;
+     part.opacityLuma = 0.f;
+   }
+-  const float threshold = alpha_threshold(config.alphaCompare);
++  // (0106: the last answer kept: draws in a row mostly test alpha alike.)
++  static AlphaCompare s_lastCompare{};
++  static float s_lastThreshold = alpha_threshold(s_lastCompare);
++  if (std::memcmp(&s_lastCompare, &config.alphaCompare, sizeof s_lastCompare) != 0) {
++    s_lastCompare = config.alphaCompare;
++    s_lastThreshold = alpha_threshold(s_lastCompare);
++  }
++  const float threshold = s_lastThreshold;
+   if (threshold > 1.f) {
+     ++g_stats.alphaNever;
+     tally(TallyAlphaNever);
+@@ -3194,7 +3452,12 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+     g_sawDepthWrite = true;
+   }
+ 
+-  DrawPlan plan;
++  // 0106: planned in the job it will go into (claimed below once the draw is kept), not copied there.
++  if (g_jobCount == g_jobs.size()) {
++    g_jobs.push_back(std::make_unique<DrawJob>());
++  }
++  DrawPlan& plan = g_jobs[g_jobCount]->plan;
++  plan = DrawPlan{};
+   plan_draw(config, plan, part.kind == aurora::mirror::PartBlend);
+   bool behind = false;
+   if (plan.behindMap >= 0) {
+@@ -3226,15 +3489,11 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+     part.wrapT = static_cast<uint8_t>(std::min<int>(obj.wrap_t(), 2));
+   }
+ 
+-  if (g_jobCount == g_jobs.size()) {
+-    g_jobs.push_back(std::make_unique<DrawJob>());
+-  }
+   DrawJob& job = *g_jobs[g_jobCount++];
+   tally(TallyKept);
+   log_textures(config, plan, part, vtxCount);
+-  job.state.capture();
++  job.state.capture(config);
+   job.config = config;
+-  job.plan = plan;
+   job.prim = prim;
+   job.vtxCount = vtxCount;
+   job.bytes.assign(vertices, vertices + static_cast<size_t>(vtxCount) * config.vtxStride);
+@@ -3243,6 +3502,7 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+   } else {
+     job.indices.clear();
+   }
++  job.segments.clear();
+   job.behind = behind;
+   job.background = background;
+   // The GPU's clip: the near plane, and the view's sides with a margin for a viewer leaning to look
+@@ -3352,12 +3612,11 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+       job.nearer *= 1.f - 2e-4f * static_cast<float>(std::min(repeat, 8u));
+     }
+   }
+-#if defined(__APPLE__)
+-  dispatch_group_async_f(g_jobGroup, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job,
+-                         [](void* context) { process(*static_cast<DrawJob*>(context)); });
+-#else
+-  process(job);
+-#endif
++  // Held back until the next draw is recorded: merged draws join it (queue_open_job).
++  queue_open_job();
++  g_openJob = &job;
++  g_mergeTarget = job.indices.empty() ? &job : nullptr;
++  g_lastLeftOut = false;
+   ++g_stats.recorded;
+   g_stats.vertices += vtxCount;
+ }
+diff --git a/lib/gx/mirror.hpp b/lib/gx/mirror.hpp
+index 01217fc..079dd46 100644
+--- a/lib/gx/mirror.hpp
++++ b/lib/gx/mirror.hpp
+@@ -15,7 +15,9 @@ void offscreen(bool begin) noexcept;
+ // GX_AURORA_DEBUG_GROUP_PUSH / POP (a test switch's labels): the label pushed, or null for a pop.
+ void debug_group(const std::string* label) noexcept;
+ // A draw as the command processor pushes it: `vertices` are vtxCount raw GX vertices laid out as
+-// `config` says; `indices` (host-endian, triangles) or none for `prim`'s own order.
++// `config` says; `indices` (host-endian, triangles) or none for `prim`'s own order. `merged`
++// (visionos/patches/aurora/0106): the command processor merged it into the draw before it (no GX
++// state changed between them), so the mirror can too.
+ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8* vertices, const u16* indices,
+-            u32 indexCount) noexcept;
++            u32 indexCount, bool merged = false) noexcept;
+ } // namespace aurora::gx::mirror

@@ -57,10 +57,10 @@ set(COS_PC_CONFIG_HEADER ${COS_NATIVE_ROOT}/include/pc/cos_pc_config.h)
 
 set(COS_GAME_COMPILE_OPTIONS
         # Force-included first in every unit: what Metrowerks and MSL provided implicitly.
-        "SHELL:-include ${COS_PC_CONFIG_HEADER}"
+        "SHELL:-include \"${COS_PC_CONFIG_HEADER}\""
         # The game's dolphin/types.h reached every unit through global.h; its names Aurora lacks (uint,
         # READU32_BE, FLOAT_MIN/MAX) come from this header instead, right after the PC config header.
-        "SHELL:-include ${COS_NATIVE_ROOT}/include/sdk/cos_sdk_extras.h"
+        "SHELL:-include \"${COS_NATIVE_ROOT}/include/sdk/cos_sdk_extras.h\""
         # Match the GameCube (and x86): plain char is signed. Same as Dusklight on ARM.
         -fsigned-char
         # Decision H8 (docs/NATIVE_PORT_PHASE4_6.md): the decompiled code type-puns through pointer

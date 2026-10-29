@@ -11,6 +11,9 @@
 #include "m_Do/m_Do_graphic.h"
 #include "d/actor/d_a_daiocta.h"
 #include "SSystem/SComponent/c_m2d_g_box.h"
+#if COS_VISIONOS
+#include "wwvr_vr.h" // visionos/host: the sea drawn per eye and per repaint in VR
+#endif
 
 // There are probably still magic numbers that depend on these,
 // so it's not recommended to modify them.
@@ -649,6 +652,15 @@ void daSea_packet_c::execute(cXyz& pos) {
 void daSea_packet_c::draw() {
     if (ChkCullStop()) return;
 
+#if COS_VISIONOS
+    // VR paints the same draw lists once per eye, and again for each display refresh until the next
+    // tick: the vertices, the same each time, are made once into the display heap (which the
+    // painter frees two ticks on) and reused, or the 64 KiB heap runs out.
+    static u32 sVrPaint = ~0u;
+    static daSea_packet_c* sVrOwner = NULL;
+    const bool vrReuse = sVrPaint == wwvr_paint_generation() && sVrOwner == this && m_draw_vtx != NULL;
+    if (!vrReuse)
+#endif
     m_draw_vtx = (cXyz*)mDoGph_gInf_c::alloc(sizeof(cXyz) * GRID_CELLS * GRID_CELLS, 0x20);
     if (m_draw_vtx == NULL) {
         return;
@@ -660,6 +672,12 @@ void daSea_packet_c::draw() {
     j3dSys.reinitGX();
 #endif
 
+#if COS_VISIONOS
+    sVrPaint = wwvr_paint_generation();
+    sVrOwner = this;
+    if (!vrReuse)
+#endif
+    {
     cXyz* vtx = m_draw_vtx;
     f32* pY = mpHeightTable;
 
@@ -683,6 +701,7 @@ void daSea_packet_c::draw() {
 #else
     DCStoreRange(m_draw_vtx, sizeof(cXyz) * GRID_CELLS * GRID_CELLS);
 #endif
+    }
 
     ResTIMG* pResTIMG = static_cast<ResTIMG*>(dComIfG_getObjectRes("Always", dRes_INDEX_ALWAYS_BTI_B_SEA_TEX0AND2_e));
 
@@ -712,10 +731,16 @@ void daSea_packet_c::draw() {
     GXLoadTexMtxImm(mDoMtx_stack_c::get(), GX_TEXMTX0, GX_MTX2x4);
     GXLoadTexObj(&mTexSea0, GX_TEXMAP0);
 
+#if COS_VISIONOS
+    // The ripples step once a tick, not once per eye and repaint (the vertices' check above).
+    if (!vrReuse)
+#endif
+    {
     mAnimCounter += 1;
 
     if (mAnimCounter > 300) {
         mAnimCounter = 0;
+    }
     }
 
     mDoMtx_stack_c::transS(0.0f, mAnimCounter / 300.0f, 0.0f);

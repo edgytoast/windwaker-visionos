@@ -8,6 +8,9 @@
 #if TARGET_PC
 #include "pc/game_hooks.h"
 #endif
+#if COS_VISIONOS
+#include "wwvr_vr.h" // visionos/host: what steps while drawing steps once a tick in VR
+#endif
 #include "d/d_bg_s_gnd_chk.h"
 #include "d/d_bg_s_roof_chk.h"
 #include "d/d_cc_d.h"
@@ -4143,7 +4146,16 @@ void dKyr_drawSibuki(Mtx drawMtx, u8** pImg) {
     else if (pPkt->mStatus & 2)
         alpha = 200.0f;
 
+#if COS_VISIONOS
+    // VR draws each eye and repaint: the spray's fade steps on the tick's first draw.
+    static u32 sVrSibukiPaint = ~0u;
+    if (sVrSibukiPaint != wwvr_paint_generation()) {
+        sVrSibukiPaint = wwvr_paint_generation();
+        cLib_addCalc(&pPkt->mSibukiAlpha, alpha, 0.2f, 30.0f, 0.001f);
+    }
+#else
     cLib_addCalc(&pPkt->mSibukiAlpha, alpha, 0.2f, 30.0f, 0.001f);
+#endif
 
     cXyz eyevect, camDir;
     dKy_set_eyevect_calc(pCamera, &eyevect, 7000.0f, 4000.0f);
@@ -5103,10 +5115,19 @@ void dKyr_drawStar(Mtx drawMtx, u8** pImg) {
     GXLoadPosMtxImm(drawMtx, GX_PNMTX0);
     GXSetCurrentMtx(GX_PNMTX0);
 
+#if COS_VISIONOS
+    // VR draws each eye and repaint: the stars turn on the tick's first draw.
+    static u32 sVrStarPaint = ~0u;
+    if (sVrStarPaint != wwvr_paint_generation()) {
+        sVrStarPaint = wwvr_paint_generation();
+#endif
     rot++;
     if (rot > 719) {
         rot = 0;
     }
+#if COS_VISIONOS
+    }
+#endif
 
     spBC.x = camera->view.mLookat.mEye.x;
     spBC.y = camera->view.mLookat.mEye.y;

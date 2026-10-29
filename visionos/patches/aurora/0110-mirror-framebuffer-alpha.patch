@@ -1,0 +1,1182 @@
+diff --git a/lib/gx/mirror.cpp b/lib/gx/mirror.cpp
+index bb6fe30..3079236 100644
+--- a/lib/gx/mirror.cpp
++++ b/lib/gx/mirror.cpp
+@@ -404,7 +404,7 @@ struct Built {
+ struct Stats {
+   uint64_t draws = 0, recorded = 0, merged = 0, lines = 0, screen = 0, noColour = 0, viewport = 0, projection = 0, blend = 0,
+            copyOnly = 0, alphaNever = 0, vertices = 0, triangles = 0, background = 0, behind = 0, frames = 0,
+-           bakes = 0, bakeTexels = 0;
++           bakes = 0, bakeTexels = 0, alphaOps = 0;
+   double seconds = 0;
+ };
+ 
+@@ -1870,6 +1870,209 @@ const bool kFogSplit = switch_on("AURORA_MIRROR_FOG_SPLIT");
+ constexpr float kFogStep = 1.f / 8.f;
+ constexpr int kFogSplits = 5;
+ 
++// --- 0110: the framebuffer's alpha, followed through a frame.
++//
++// Wind Waker lights and darkens parts of its picture through the framebuffer's alpha. A torch's or
++// a lantern's glow, a light tag's, a searchlight's beam (dDlst_alphaModel_c): spheres (or a cube, a
++// beam) drawn into the alpha only, from behind with the depth test reversed, from the front, and
++// from the front again subtracted, which leaves the sphere's alpha where the scene's surface lies
++// inside it; then a quad over the whole picture adds a colour by that alpha (drawAlphaBuffer). A
++// dark room (the spot model): the alpha set over the whole picture, Link's light added in two
++// spheres around him, doubled, and the picture multiplied by it (drawSpot). The mirror left all of
++// it out: the alpha-only draws write no colour, and the quads are flat.
++//
++// Now each alpha-only draw without a texture is kept as an operation on the alpha: a volume (its
++// triangles, decoded on the workers, as the planes of a convex solid: which faces it draws, its
++// depth test, its blend on the alpha, its alpha) or the whole picture (a flat quad). A flat quad
++// drawn by the alpha is a layer, worked into what was drawn before it (build_alpha_layers): the
++// alpha at a point found by playing the operations there (the ray from the camera through it: where
++// it enters and leaves each volume, against the surface's depth), the ground cut along a light's
++// volume where they meet. Built by the finishing worker.
++struct AlphaOp {
++  bool screen = false;             // the whole picture (a flat quad); else a volume
++  bool front = true, back = true;  // the faces it draws (its cull mode)
++  bool depthTest = false;
++  GXCompare depthFunc = GX_ALWAYS;
++  GXBlendMode mode = GX_BM_NONE;
++  GXBlendFactor src = GX_BL_ONE, dst = GX_BL_ZERO;
++  float alpha = 0.f;               // the TEV's alpha
++  bool constant = false;           // GXSetDstAlpha: this alpha is written whatever the blend
++  float constantAlpha = 0.f;
++  // A volume's planes (inside where n.x <= d) and bounding sphere, from its draw (merge_jobs).
++  std::vector<std::array<float, 4>> planes;
++  float centre[3] = {0.f, 0.f, 0.f};
++  float radius = 0.f;
++  // A flat quad setting the alpha over the whole picture: the frame's draws before it (and a group
++  // made in its place, which keeps the draws on either side apart), for a layer multiplying by the
++  // alpha it sets up (see AlphaLayer).
++  size_t jobs = 0;
++  int group = -1;
++};
++struct AlphaLayer {
++  size_t ops = 0;          // the operations before it
++  uint32_t vertexEnd = 0;  // the frame's vertices drawn before it (merge_jobs)
++  size_t group = 0;        // its place in the frame's groups (it draws nothing of its own)
++  float colour[3] = {0.f, 0.f, 0.f};
++  float alpha = 0.f;       // the quad's TEV alpha
++  GXBlendFactor src = GX_BL_ONE, dst = GX_BL_ZERO;
++  // A layer that multiplies (a dark room's) reads the alpha set up by the flat quad clearing it (job
++  // `fromJob`): the translucent draws before it, and those after it that don't write the alpha
++  // (particles do: as bright in the dark as out of it), are darkened in place, their vertices'
++  // colours (vertex ranges, merge_jobs).
++  size_t fromJob = SIZE_MAX, toJob = 0;
++  std::vector<std::pair<uint32_t, uint32_t>> darken;
++};
++std::vector<AlphaOp> g_alphaOps;       // this frame's (FIFO thread)
++std::vector<AlphaLayer> g_alphaLayers; // this frame's
++float g_alphaStart = 0.f;              // the alpha the frame starts with (the copy's clear colour)
++// 0110 test switch: AURORA_MIRROR_ALPHA_BUFFER=0 leaves the framebuffer's alpha out, as before.
++const bool kAlphaBuffer = switch_on("AURORA_MIRROR_ALPHA_BUFFER");
++
++// A blend factor's value on the alpha (src: the source's slot, where 2 and 3 are the destination's
++// colour, as in the destination's slot they're the source's).
++float alpha_factor(GXBlendFactor factor, bool srcSlot, float s, float d) {
++  switch (factor) {
++  case GX_BL_ZERO:
++    return 0.f;
++  case GX_BL_ONE:
++    return 1.f;
++  case GX_BL_SRCCLR:
++    return srcSlot ? d : s;
++  case GX_BL_INVSRCCLR:
++    return srcSlot ? 1.f - d : 1.f - s;
++  case GX_BL_SRCALPHA:
++    return s;
++  case GX_BL_INVSRCALPHA:
++    return 1.f - s;
++  case GX_BL_DSTALPHA:
++    return d;
++  case GX_BL_INVDSTALPHA:
++    return 1.f - d;
++  default:
++    return 1.f;
++  }
++}
++
++// What an operation leaves in the alpha over `d`.
++float alpha_blend(const AlphaOp& op, float d) {
++  if (op.constant) {
++    return op.constantAlpha;
++  }
++  const float s = op.alpha;
++  switch (op.mode) {
++  case GX_BM_NONE:
++    return s;
++  case GX_BM_SUBTRACT:
++    return std::clamp(d - s, 0.f, 1.f);
++  case GX_BM_BLEND:
++    return std::clamp(s * alpha_factor(op.src, true, s, d) + d * alpha_factor(op.dst, false, s, d), 0.f, 1.f);
++  default:
++    return d; // a logic op: left as it was
++  }
++}
++
++bool depth_passes(GXCompare func, float fragment, float surface) {
++  const float eps = 1e-4f * surface;
++  switch (func) {
++  case GX_NEVER:
++    return false;
++  case GX_LESS:
++    return fragment < surface - eps;
++  case GX_EQUAL:
++    return std::fabs(fragment - surface) <= eps;
++  case GX_LEQUAL:
++    return fragment <= surface + eps;
++  case GX_GREATER:
++    return fragment > surface + eps;
++  case GX_NEQUAL:
++    return std::fabs(fragment - surface) > eps;
++  case GX_GEQUAL:
++    return fragment >= surface - eps;
++  default:
++    return true;
++  }
++}
++
++// The alpha at a surface point p (view space) after the first `count` operations: each volume met
++// by the ray from the camera through p (p at t = 1) where it enters (its front faces) and leaves
++// (its back faces), each tested against the surface's depth. With `volumes` false, as if no volume
++// covered p (the alpha away from them all).
++float alpha_at(const std::vector<AlphaOp>& ops, size_t count, float start, const float p[3], bool volumes = true,
++               const std::vector<uint8_t>* live = nullptr) {
++  float a = start;
++  const float pp = p[0] * p[0] + p[1] * p[1] + p[2] * p[2];
++  // A volume is drawn two or three times running (from behind, from the front, taken off): where the
++  // ray meets it, worked out once.
++  const AlphaOp* last = nullptr;
++  bool lastHit = false;
++  float lastIn = 0.f, lastOut = 0.f;
++  for (size_t i = 0; i < count && i < ops.size(); ++i) {
++    if (live != nullptr && i < live->size() && !(*live)[i]) {
++      continue;
++    }
++    const AlphaOp& op = ops[i];
++    if (op.screen) {
++      a = alpha_blend(op, a);
++      continue;
++    }
++    if (!volumes || op.planes.empty() || pp <= 0.f) {
++      continue;
++    }
++    float tIn = -INFINITY, tOut = INFINITY;
++    bool hit = true;
++    if (last != nullptr && last->radius == op.radius && last->centre[0] == op.centre[0] && last->centre[1] == op.centre[1] &&
++        last->centre[2] == op.centre[2] && last->planes.size() == op.planes.size()) {
++      hit = lastHit;
++      tIn = lastIn;
++      tOut = lastOut;
++    } else {
++      // The ray past the bounding sphere: nothing.
++      const float cp = op.centre[0] * p[0] + op.centre[1] * p[1] + op.centre[2] * p[2];
++      const float tc = cp / pp;
++      float closest = 0.f;
++      for (int c = 0; c < 3; ++c) {
++        const float v = op.centre[c] - (tc > 0.f ? tc : 0.f) * p[c];
++        closest += v * v;
++      }
++      if (closest > op.radius * op.radius) {
++        hit = false;
++      } else {
++        for (const auto& plane : op.planes) {
++          const float np = plane[0] * p[0] + plane[1] * p[1] + plane[2] * p[2];
++          if (std::fabs(np) < 1e-12f) {
++            if (plane[3] < 0.f) {
++              hit = false; // the camera outside this plane, the ray along it
++              break;
++            }
++            continue;
++          }
++          const float t = plane[3] / np;
++          if (np > 0.f) {
++            tOut = std::min(tOut, t);
++          } else {
++            tIn = std::max(tIn, t);
++          }
++        }
++      }
++      last = &op;
++      lastHit = hit;
++      lastIn = tIn;
++      lastOut = tOut;
++    }
++    if (!hit || !(tIn <= tOut)) {
++      continue;
++    }
++    constexpr float kNear = 1e-4f;
++    if (op.back && tOut > kNear && (!op.depthTest || depth_passes(op.depthFunc, tOut, 1.f))) {
++      a = alpha_blend(op, a);
++    }
++    if (op.front && tIn > kNear && (!op.depthTest || depth_passes(op.depthFunc, tIn, 1.f))) {
++      a = alpha_blend(op, a);
++    }
++  }
++  return a;
++}
++
+ // --- Draws, decoded on worker threads. The FIFO thread snapshots what a draw's vertices read and
+ // moves on; the frame's END waits for them all and merges them in the game's order. The game's
+ // vertex arrays stay put until then: the game thread waits for the FIFO before its next frame.
+@@ -1923,6 +2126,10 @@ struct DrawJob {
+     uint32_t first, count;
+   };
+   std::vector<Segment> segments;
++  // 0110: an alpha-only volume (its operation's index: decoded, not drawn), or an alpha layer's place.
++  int alphaOp = -1;
++  int alphaLayer = -1;
++  bool writesAlpha = false; // its pixels' alpha goes into the framebuffer's (a particle's)
+   // Out: its vertices (clipping adds some) and triangles into them, wound for RealityKit.
+   std::vector<MirrorVertex> vertices;
+   std::vector<uint32_t> triangles;
+@@ -2285,7 +2492,8 @@ void build_triangles(DrawJob& job) {
+     uint32_t polygon[9] = {a, b, c};
+     int count = 3;
+     // The sky only at the near plane: it goes on past the view's sides, for a viewer leaning in.
+-    const int planes = job.background ? 1 : 5;
++    // (0110: an alpha volume not at all: it's the solid, not a picture of it.)
++    const int planes = job.alphaOp >= 0 ? 0 : job.background ? 1 : 5;
+     for (int plane = 0; plane < planes && count >= 3; ++plane) {
+       float values[9];
+       int outside = 0;
+@@ -2473,7 +2681,7 @@ void process(DrawJob& job) {
+   const Decoder decoder{job.state, job.config, job.bytes.data(), job.bytes.size()};
+   job.vertices.resize(job.vtxCount);
+   job.triangles.clear();
+-  job.fogged = kFogSplit && job.state.fog.type != GX_FOG_NONE;
++  job.fogged = kFogSplit && job.state.fog.type != GX_FOG_NONE && job.alphaOp < 0;
+   job.prefog.resize(job.fogged ? job.vtxCount : 0);
+   job.nearest = INFINITY;
+   job.farthest = 0;
+@@ -2578,6 +2786,71 @@ void merge_jobs() {
+   static std::vector<uint8_t> sane; // FIFO thread: kept, not made again each frame
+   for (size_t i = 0; i < g_jobCount; ++i) {
+     DrawJob& job = *g_jobs[i];
++    // 0110: an alpha volume's planes (oriented away from its centre: a convex solid), and an alpha
++    // layer's place among the frame's vertices.
++    if (job.alphaOp >= 0) {
++      AlphaOp& op = g_alphaOps[static_cast<size_t>(job.alphaOp)];
++      double sum[3] = {0, 0, 0};
++      size_t used = 0;
++      for (const MirrorVertex& v : job.vertices) {
++        if (!runaway(v.position)) {
++          for (int c = 0; c < 3; ++c) {
++            sum[c] += v.position[c];
++          }
++          ++used;
++        }
++      }
++      if (used == 0) {
++        continue;
++      }
++      for (int c = 0; c < 3; ++c) {
++        op.centre[c] = static_cast<float>(sum[c] / static_cast<double>(used));
++      }
++      float radius = 0.f;
++      for (const MirrorVertex& v : job.vertices) {
++        if (!runaway(v.position)) {
++          float r = 0.f;
++          for (int c = 0; c < 3; ++c) {
++            r += (v.position[c] - op.centre[c]) * (v.position[c] - op.centre[c]);
++          }
++          radius = std::max(radius, r);
++        }
++      }
++      op.radius = std::sqrt(radius) * 1.001f + 1e-3f;
++      op.planes.clear();
++      for (size_t t = 0; t + 2 < job.triangles.size(); t += 3) {
++        const float* a = job.vertices[job.triangles[t]].position;
++        const float* b = job.vertices[job.triangles[t + 1]].position;
++        const float* c = job.vertices[job.triangles[t + 2]].position;
++        const F3 e1{b[0] - a[0], b[1] - a[1], b[2] - a[2]}, e2{c[0] - a[0], c[1] - a[1], c[2] - a[2]};
++        F3 n{e1.y * e2.z - e1.z * e2.y, e1.z * e2.x - e1.x * e2.z, e1.x * e2.y - e1.y * e2.x};
++        const float length = std::sqrt(dot(n, n));
++        if (!(length > 1e-6f)) {
++          continue;
++        }
++        n = {n.x / length, n.y / length, n.z / length};
++        float d = n.x * a[0] + n.y * a[1] + n.z * a[2];
++        if (n.x * op.centre[0] + n.y * op.centre[1] + n.z * op.centre[2] > d) {
++          n = {-n.x, -n.y, -n.z};
++          d = -d;
++        }
++        bool same = false;
++        for (const auto& q : op.planes) {
++          if (q[0] * n.x + q[1] * n.y + q[2] * n.z > 0.9999f && std::fabs(q[3] - d) < 1e-3f * (1.f + std::fabs(d))) {
++            same = true;
++            break;
++          }
++        }
++        if (!same) {
++          op.planes.push_back({n.x, n.y, n.z, d});
++        }
++      }
++      continue;
++    }
++    if (job.alphaLayer >= 0) {
++      g_alphaLayers[static_cast<size_t>(job.alphaLayer)].vertexEnd = static_cast<uint32_t>(g_building.vertices.size());
++      continue;
++    }
+     const auto base = static_cast<uint32_t>(g_building.vertices.size());
+     if (job.nearer != 1.f && !job.background) {
+       for (MirrorVertex& vertex : job.vertices) {
+@@ -2591,6 +2864,19 @@ void merge_jobs() {
+       sane[v] = !runaway(job.vertices[v].position);
+     }
+     g_building.vertices.insert(g_building.vertices.end(), job.vertices.begin(), job.vertices.end());
++    // 0110: a translucent draw before a dark room's darkening: darkened in place (build_alpha_layers),
++    // as the game's picture is under it; one after its alpha was set up that writes the alpha too (a
++    // particle: as bright in the dark as out of it) is left as it is. (Those before the set-up, a
++    // cave's misty rim, stayed bright in the dark.)
++    // And the background (a cave's backdrop, drawn first and apart): darkened in place too, solid or
++    // not (the layer is laid on solid ground only).
++    if (job.group < g_groups.size() && (g_groups[job.group].blended || job.background)) {
++      for (AlphaLayer& layer : g_alphaLayers) {
++        if (layer.fromJob != SIZE_MAX && i < layer.toJob && (i < layer.fromJob || !job.writesAlpha || job.background)) {
++          layer.darken.emplace_back(base, static_cast<uint32_t>(g_building.vertices.size()));
++        }
++      }
++    }
+     if (job.decal) {
+       g_decalRanges.emplace_back(base, static_cast<uint32_t>(g_building.vertices.size()));
+     }
+@@ -2806,6 +3092,9 @@ void log_skipped(const ShaderConfig& config, const MirrorPart& part, u16 vtxCoun
+ }
+ 
+ void begin_frame() {
++  g_alphaOps.clear();
++  g_alphaLayers.clear();
++  g_alphaStart = std::clamp(g_gxState.clearColor[3], 0.f, 1.f);
+   g_bakeOccurrences.clear();
+   g_bakeKeys.clear();
+   g_bakeTexels = 0;
+@@ -2989,6 +3278,9 @@ struct Job {
+   Built built;
+   std::vector<Group> groups;
+   std::vector<std::pair<uint32_t, uint32_t>> backgroundRanges, decalRanges;
++  std::vector<AlphaOp> alphaOps;       // 0110
++  std::vector<AlphaLayer> alphaLayers;
++  float alphaStart = 0.f;
+   float farthest = 0, nearestBackground = INFINITY;
+   bool scene = false;
+   uint32_t tag = 0;
+@@ -3004,6 +3296,7 @@ Job g_job; // handed over, waiting for the worker
+ bool g_jobPending = false;
+ std::atomic<uint64_t> g_finishNanos{0}, g_finished{0}, g_dropped{0};
+ std::atomic<uint32_t> g_lastParts{0};
++std::atomic<uint64_t> g_alphaLayerTriangles{0}; // 0110: the pieces cut where lights meet the ground (periodic log)
+ // The last frame's glass and focus (game units) and its share of vertices squashed into the near
+ // band, for the periodic log.
+ std::atomic<float> g_lastPlane{0}, g_lastFocus{0}, g_lastBandShare{0};
+@@ -3013,6 +3306,567 @@ std::atomic<float> g_lastPlane{0}, g_lastFocus{0}, g_lastBandShare{0};
+ std::atomic<float> g_frontAllowance{0}, g_cameraWidths{0};
+ std::atomic<float> g_lastAllowance{0}; // the last frame's, the lesser limit (finish)
+ 
++// 0110: the alpha layers (see AlphaOp), worked into what they lie on. A layer's quad blends a colour
++// over the picture by the alpha left at each point: GX: out = C * fs(a) + dst * fd(a), in the
++// picture's gamma. Here each solid draw before the layer (and the background) takes it in place, as
++// its vertices' colours: mul * fd and add * fd + C * fs, which the shader works out in the picture's
++// gamma too (the texture's colour times mul, plus add), so it's GX's own sum at each vertex. Where a
++// light's volume meets the ground (one whose operations count only where a surface lies inside it:
++// drawn from behind against the surface's depth, from the front, and taken off again, as the game's
++// lights are) the ground's triangles are cut along the volume's own planes, each piece taking the
++// alpha at its middle: the edge of a light's circle as sharp as the game's. Other volumes (counting
++// in front of a surface or behind it too) are taken at the vertices. (Laid over the ground as a
++// blended copy instead, the copy fell behind the eased ground near the camera in patches, a cave's
++// lit rim, and copying a dark room's every triangle cost the finishing worker 20 ms a frame.)
++// And the translucent draws a multiplying layer darkens in place (AlphaLayer::darken).
++// Test runs: AURORA_MIRROR_ALPHA_LOG=1 logs the operations and layers now and then.
++size_t build_alpha_layers(Job& job) {
++  Built& out = job.built;
++  const size_t before = out.vertices.size();
++  if (job.alphaLayers.empty()) {
++    return 0;
++  }
++  static const bool s_log = [] {
++    const char* value = std::getenv("AURORA_MIRROR_ALPHA_LOG");
++    return value != nullptr && std::strcmp(value, "1") == 0;
++  }();
++  static uint32_t s_logged = 0;
++  const bool log = s_log && s_logged++ % 150 == 0;
++  if (log) {
++    for (size_t i = 0; i < job.alphaOps.size(); ++i) {
++      const AlphaOp& op = job.alphaOps[i];
++      Log.info("mirror alpha op {}: {} faces {}{} depth {}/{} blend {} {}->{} alpha {:.3f}{} centre ({:.0f} {:.0f} {:.0f}) "
++               "radius {:.0f}, {} planes, group {}",
++               i, op.screen ? "screen" : "volume", op.front ? "F" : "", op.back ? "B" : "", op.depthTest,
++               static_cast<int>(op.depthFunc), static_cast<int>(op.mode), static_cast<int>(op.src),
++               static_cast<int>(op.dst), op.alpha, op.constant ? fmt::format(" (written {:.3f})", op.constantAlpha) : "",
++               op.centre[0], op.centre[1], op.centre[2], op.radius, op.planes.size(), op.group);
++    }
++  }
++  struct Sphere {
++    float c[3], r;
++  };
++  struct Plan {
++    AlphaLayer* layer;
++    size_t opCount;
++    std::vector<uint8_t> live;
++    std::vector<Sphere> spheres; // every live volume's
++    float away;
++    bool everywhere;
++  };
++  const float origin[3] = {0.f, 0.f, -1.f};
++  std::vector<Plan> plans;
++  // The volumes cut along (inside-only ones, any layer's), each once.
++  std::vector<const AlphaOp*> cut;
++  for (AlphaLayer& layer : job.alphaLayers) {
++    Plan plan{&layer, std::min(layer.ops, job.alphaOps.size()), {}, {}, 0.f, false};
++    const size_t opCount = plan.opCount;
++    // Operations that leave nothing behind: a volume drawn again later, untested, setting the alpha
++    // to a constant (a real-time shadow's box: drawn into the alpha, then cleared), and such a
++    // setting that only gives back the alpha around it.
++    plan.live.assign(opCount, 1);
++    for (size_t j = 0; j < opCount; ++j) {
++      const AlphaOp& reset = job.alphaOps[j];
++      const bool sets = !reset.screen && !reset.planes.empty() && !reset.depthTest && reset.front && reset.back &&
++                        (reset.constant || reset.mode == GX_BM_NONE);
++      if (!sets) {
++        continue;
++      }
++      for (size_t i = 0; i < j; ++i) {
++        const AlphaOp& op = job.alphaOps[i];
++        if (op.screen || op.planes.empty()) {
++          continue;
++        }
++        float d2 = 0.f;
++        for (int c = 0; c < 3; ++c) {
++          d2 += (op.centre[c] - reset.centre[c]) * (op.centre[c] - reset.centre[c]);
++        }
++        // (The same volume: the shadow's box, drawn again.)
++        if (std::sqrt(d2) <= 0.01f * reset.radius && std::fabs(op.radius - reset.radius) <= 0.01f * reset.radius) {
++          plan.live[i] = 0;
++        }
++      }
++      const float written = reset.constant ? reset.constantAlpha : reset.alpha;
++      if (std::fabs(written - alpha_at(job.alphaOps, j, job.alphaStart, origin, false)) < 1.f / 512.f) {
++        plan.live[j] = 0;
++      }
++    }
++    plan.away = alpha_at(job.alphaOps, opCount, job.alphaStart, origin, false);
++    float fs0 = alpha_factor(layer.src, true, layer.alpha, plan.away);
++    float fd0 = alpha_factor(layer.dst, false, layer.alpha, plan.away);
++    plan.everywhere = (fs0 * (layer.colour[0] + layer.colour[1] + layer.colour[2]) > 1e-3f) || std::fabs(fd0 - 1.f) > 1e-3f;
++    for (size_t i = 0; i < opCount; ++i) {
++      const AlphaOp& op = job.alphaOps[i];
++      if (!plan.live[i] || op.screen || op.planes.empty()) {
++        continue;
++      }
++      const auto same = [&](const AlphaOp& other) {
++        return std::fabs(other.centre[0] - op.centre[0]) + std::fabs(other.centre[1] - op.centre[1]) +
++                       std::fabs(other.centre[2] - op.centre[2]) <=
++                   0.01f * op.radius &&
++               std::fabs(other.radius - op.radius) <= 0.01f * op.radius;
++      };
++      if (std::any_of(plan.spheres.begin(), plan.spheres.end(), [&](const Sphere& s) {
++            return std::fabs(s.c[0] - op.centre[0]) + std::fabs(s.c[1] - op.centre[1]) + std::fabs(s.c[2] - op.centre[2]) <=
++                       0.01f * op.radius &&
++                   std::fabs(s.r - op.radius) <= 0.01f * op.radius;
++          })) {
++        continue; // the same volume's other draws
++      }
++      plan.spheres.push_back({{op.centre[0], op.centre[1], op.centre[2]}, op.radius});
++      if (std::any_of(cut.begin(), cut.end(), [&](const AlphaOp* other) { return same(*other); })) {
++        continue;
++      }
++      // Inside-only: just in front of it and just behind it, on the line through its middle, with
++      // only its own draws (and those over the whole picture), as away from it.
++      // The game's own pattern (dDlst_alphaModel_c and the spot model: from behind, depth GEQUAL,
++      // added; from the front, LEQUAL, added; from the front, untested, taken off) counts only inside,
++      // wherever the camera is (a searchlight's beam reaching past it).
++      int behindAdd = 0, frontAdd = 0, frontSub = 0, others = 0;
++      for (size_t k = 0; k < opCount; ++k) {
++        const AlphaOp& other = job.alphaOps[k];
++        if (!plan.live[k] || other.screen || !same(other)) {
++          continue;
++        }
++        const bool adds = other.mode == GX_BM_BLEND && other.src == GX_BL_ONE && other.dst == GX_BL_ONE;
++        if (other.back && !other.front && other.depthTest && other.depthFunc == GX_GEQUAL && adds) {
++          ++behindAdd;
++        } else if (other.front && !other.back && other.depthTest && other.depthFunc == GX_LEQUAL && adds) {
++          ++frontAdd;
++        } else if (other.front && !other.back && !other.depthTest && other.mode == GX_BM_SUBTRACT) {
++          ++frontSub;
++        } else {
++          ++others;
++        }
++      }
++      const bool pattern = behindAdd == 1 && frontAdd == 1 && frontSub == 1 && others == 0;
++      const float d = std::sqrt(op.centre[0] * op.centre[0] + op.centre[1] * op.centre[1] + op.centre[2] * op.centre[2]);
++      bool insideOnly = !pattern && d > 1.1f * op.radius;
++      if (insideOnly) {
++        std::vector<uint8_t> own(opCount, 0);
++        for (size_t k = 0; k < opCount; ++k) {
++          own[k] = plan.live[k] && (job.alphaOps[k].screen || same(job.alphaOps[k]));
++        }
++        const float ownAway = alpha_at(job.alphaOps, opCount, job.alphaStart, origin, false, &own);
++        float front[3], behind[3];
++        for (int c = 0; c < 3; ++c) {
++          front[c] = op.centre[c] * (1.f - 1.05f * op.radius / d);
++          behind[c] = op.centre[c] * (1.f + 1.05f * op.radius / d);
++        }
++        insideOnly = std::fabs(alpha_at(job.alphaOps, opCount, job.alphaStart, front, true, &own) - ownAway) < 1.f / 512.f &&
++                     std::fabs(alpha_at(job.alphaOps, opCount, job.alphaStart, behind, true, &own) - ownAway) < 1.f / 512.f;
++      }
++      if (pattern || insideOnly) {
++        cut.push_back(&op);
++      }
++    }
++    plans.push_back(std::move(plan));
++  }
++  // Nothing to change (the game draws its alpha's quad every frame, lights or none): no volume left,
++  // and away from them the layers add nothing and keep everything.
++  if (cut.empty() && std::all_of(plans.begin(), plans.end(), [](const Plan& plan) {
++        return plan.spheres.empty() && !plan.everywhere;
++      })) {
++    return 0;
++  }
++  // The alpha a layer leaves at a point: the one away from them all, outside every volume's sphere.
++  const auto alphaAt = [&](const Plan& plan, const float p[3]) {
++    const float pp = p[0] * p[0] + p[1] * p[1] + p[2] * p[2];
++    for (const Sphere& sphere : plan.spheres) {
++      const float cp = sphere.c[0] * p[0] + sphere.c[1] * p[1] + sphere.c[2] * p[2];
++      const float t = pp > 0.f ? std::max(cp / pp, 0.f) : 0.f;
++      float d2 = 0.f;
++      for (int c = 0; c < 3; ++c) {
++        const float v = sphere.c[c] - t * p[c];
++        d2 += v * v;
++      }
++      if (d2 <= sphere.r * sphere.r) {
++        return alpha_at(job.alphaOps, plan.opCount, job.alphaStart, p, true, &plan.live);
++      }
++    }
++    return plan.away;
++  };
++  // The layer's blend at a vertex, in place: mul * fd, add * fd + C * fs.
++  const auto apply = [](const Plan& plan, MirrorVertex& vertex, float a) {
++    const AlphaLayer& layer = *plan.layer;
++    const float fs = std::max(alpha_factor(layer.src, true, layer.alpha, a), 0.f);
++    const float fd = std::clamp(alpha_factor(layer.dst, false, layer.alpha, a), 0.f, 1.f);
++    for (int c = 0; c < 3; ++c) {
++      vertex.mul[c] = half(from_half(vertex.mul[c]) * fd);
++      vertex.add[c] = half(from_half(vertex.add[c]) * fd + layer.colour[c] * fs);
++    }
++  };
++  const auto lerp = [](const MirrorVertex& a, const MirrorVertex& b, float t) {
++    MirrorVertex m{};
++    for (int c = 0; c < 3; ++c) {
++      m.position[c] = a.position[c] + (b.position[c] - a.position[c]) * t;
++    }
++    for (int c = 0; c < 2; ++c) {
++      m.uv[c] = a.uv[c] + (b.uv[c] - a.uv[c]) * t;
++    }
++    for (int c = 0; c < 4; ++c) {
++      m.mul[c] = half(from_half(a.mul[c]) + (from_half(b.mul[c]) - from_half(a.mul[c])) * t);
++      m.add[c] = half(from_half(a.add[c]) + (from_half(b.add[c]) - from_half(a.add[c])) * t);
++    }
++    return m;
++  };
++  // A polygon's corner: the vertex, and which of its triangle's edges it lies on (bit k: the edge
++  // from corner k to corner k + 1; a corner of the triangle lies on two).
++  struct Corner {
++    MirrorVertex v;
++    uint8_t edges;
++  };
++  // A convex polygon's parts inside (n.x <= d) and outside a plane.
++  const auto split = [&](const std::vector<Corner>& polygon, const std::array<float, 4>& plane, std::vector<Corner>& in,
++                         std::vector<Corner>& outside) {
++    in.clear();
++    outside.clear();
++    const size_t n = polygon.size();
++    for (size_t i = 0; i < n; ++i) {
++      const Corner& a = polygon[i];
++      const Corner& b = polygon[(i + 1) % n];
++      const float da = plane[0] * a.v.position[0] + plane[1] * a.v.position[1] + plane[2] * a.v.position[2] - plane[3];
++      const float db = plane[0] * b.v.position[0] + plane[1] * b.v.position[1] + plane[2] * b.v.position[2] - plane[3];
++      (da <= 0.f ? in : outside).push_back(a);
++      if ((da <= 0.f) != (db <= 0.f)) {
++        const Corner m{lerp(a.v, b.v, da / (da - db)), static_cast<uint8_t>(a.edges & b.edges)};
++        in.push_back(m);
++        outside.push_back(m);
++      }
++    }
++  };
++  // Where a point lies along the edge between two of the frame's vertices, from the lower-numbered.
++  const auto edgeKey = [](uint32_t i, uint32_t j) { return static_cast<uint64_t>(std::min(i, j)) << 32 | std::max(i, j); };
++  const auto along = [&](uint32_t i, uint32_t j, const float p[3]) {
++    const float* a = out.vertices[std::min(i, j)].position;
++    const float* b = out.vertices[std::max(i, j)].position;
++    float ab[3], ap = 0.f, ab2 = 0.f;
++    for (int c = 0; c < 3; ++c) {
++      ab[c] = b[c] - a[c];
++      ap += (p[c] - a[c]) * ab[c];
++      ab2 += ab[c] * ab[c];
++    }
++    return ab2 > 0.f ? ap / ab2 : 0.f;
++  };
++  struct Piece {
++    std::vector<Corner> corners;
++    uint32_t tri[3];
++  };
++  struct Item {
++    uint32_t tri[3];
++    uint32_t first, end; // its pieces, when it's cut (first == end: whole)
++  };
++  static thread_local std::vector<Piece> allPieces;
++  static thread_local std::vector<std::vector<Corner>> pieces;
++  static thread_local std::vector<Corner> cutIn, cutOut;
++  static thread_local std::vector<const AlphaOp*> cutHere;
++  static thread_local std::vector<uint8_t> shaded; // original vertices to shade in place
++  static thread_local std::vector<uint32_t> kept;
++  static thread_local std::vector<float> alphas;
++  static thread_local std::vector<Item> items;
++  static thread_local std::vector<std::pair<size_t, size_t>> groupItems; // per group, its items (none: not ground)
++  // The points cut into each of the frame's edges, to be cut into the triangles on the edge's other
++  // side too: with a vertex there on one side only, the easing in front of the glass (which moves
++  // every vertex along its own line of sight) opened a crack along the edge.
++  static thread_local absl::flat_hash_map<uint64_t, std::vector<std::pair<float, MirrorVertex>>> edgePoints;
++  shaded.assign(before, 0);
++  allPieces.clear();
++  items.clear();
++  groupItems.assign(job.groups.size(), {0, 0});
++  edgePoints.erase(edgePoints.begin(), edgePoints.end());
++  size_t cutTriangles = 0, pieceCount = 0, shadedCount = 0;
++  const auto isGround = [](const Group& group) {
++    // Solid ground, cut-out included.
++    return !group.blended && (group.part.kind == aurora::mirror::PartOpaque || group.part.kind == aurora::mirror::PartCutout) &&
++           (group.part.flags & aurora::mirror::PartDepthWrite) != 0 && (group.part.flags & aurora::mirror::PartBackground) == 0;
++  };
++  // Each triangle cut along the volumes whose edge crosses it, or left whole.
++  for (size_t g = 0; g < job.groups.size(); ++g) {
++    Group& group = job.groups[g];
++    if (!isGround(group)) {
++      continue;
++    }
++    groupItems[g].first = items.size();
++    const size_t count = group.indices.size();
++    for (size_t t = 0; t + 2 < count; t += 3) {
++      Item item{{group.indices[t], group.indices[t + 1], group.indices[t + 2]}, 0, 0};
++      const uint32_t* tri = item.tri;
++      const uint32_t last = std::max({tri[0], tri[1], tri[2]});
++      bool any = false;
++      for (const Plan& plan : plans) {
++        any = any || last < plan.layer->vertexEnd;
++      }
++      if (!any || last >= before) {
++        items.push_back(item);
++        continue;
++      }
++      float low[3], high[3];
++      for (int c = 0; c < 3; ++c) {
++        low[c] = std::min({out.vertices[tri[0]].position[c], out.vertices[tri[1]].position[c], out.vertices[tri[2]].position[c]});
++        high[c] = std::max({out.vertices[tri[0]].position[c], out.vertices[tri[1]].position[c], out.vertices[tri[2]].position[c]});
++      }
++      // The volumes whose edge crosses it: not all its corners outside one plane (then it's out), nor
++      // all inside every plane (then it's in, and its corners say so).
++      cutHere.clear();
++      for (const AlphaOp* volume : cut) {
++        bool overlaps = true;
++        for (int c = 0; c < 3 && overlaps; ++c) {
++          overlaps = volume->centre[c] + volume->radius >= low[c] && volume->centre[c] - volume->radius <= high[c];
++        }
++        if (!overlaps) {
++          continue;
++        }
++        bool outside = false, inside = true;
++        for (const auto& plane : volume->planes) {
++          int beyond = 0;
++          for (int k = 0; k < 3; ++k) {
++            const float* q = out.vertices[tri[k]].position;
++            beyond += plane[0] * q[0] + plane[1] * q[1] + plane[2] * q[2] - plane[3] > 0.f;
++          }
++          if (beyond == 3) {
++            outside = true;
++            break;
++          }
++          inside = inside && beyond == 0;
++        }
++        if (!outside && !inside) {
++          cutHere.push_back(volume);
++        }
++      }
++      if (cutHere.empty()) {
++        items.push_back(item);
++        continue;
++      }
++      ++cutTriangles;
++      pieces.clear();
++      pieces.push_back({{out.vertices[tri[0]], 0b101}, {out.vertices[tri[1]], 0b011}, {out.vertices[tri[2]], 0b110}});
++      for (const AlphaOp* volume : cutHere) {
++        const size_t pieceCountNow = pieces.size();
++        for (size_t q = 0; q < pieceCountNow; ++q) {
++          std::vector<Corner> inside = std::move(pieces[q]);
++          pieces[q].clear();
++          bool placed = false;
++          for (const auto& plane : volume->planes) {
++            split(inside, plane, cutIn, cutOut);
++            if (cutOut.size() >= 3) {
++              if (!placed) {
++                pieces[q] = cutOut;
++                placed = true;
++              } else {
++                pieces.push_back(cutOut);
++              }
++            }
++            inside.swap(cutIn);
++            if (inside.size() < 3) {
++              break;
++            }
++          }
++          if (inside.size() >= 3) {
++            if (!placed) {
++              pieces[q] = std::move(inside);
++            } else {
++              pieces.push_back(std::move(inside));
++            }
++          }
++        }
++      }
++      item.first = static_cast<uint32_t>(allPieces.size());
++      for (std::vector<Corner>& piece : pieces) {
++        if (piece.size() < 3) {
++          continue;
++        }
++        // Its points on the triangle's edges (a cut, not a corner), for the triangles beyond them.
++        for (const Corner& corner : piece) {
++          for (int e = 0; e < 3; ++e) {
++            if (corner.edges == (1u << e)) {
++              const uint32_t i = tri[e], j = tri[(e + 1) % 3];
++              edgePoints[edgeKey(i, j)].emplace_back(along(i, j, corner.v.position), corner.v);
++            }
++          }
++        }
++        Piece made;
++        made.corners = std::move(piece);
++        std::copy(tri, tri + 3, made.tri);
++        allPieces.push_back(std::move(made));
++      }
++      item.end = static_cast<uint32_t>(allPieces.size());
++      items.push_back(item);
++    }
++    groupItems[g].second = items.size();
++  }
++  // A polygon's edges on its triangle's edges with the points cut there from either side put in.
++  static thread_local std::vector<Corner> welded;
++  const auto weld = [&](const std::vector<Corner>& polygon, const uint32_t tri[3]) {
++    welded.clear();
++    const size_t n = polygon.size();
++    for (size_t k = 0; k < n; ++k) {
++      const Corner& a = polygon[k];
++      const Corner& b = polygon[(k + 1) % n];
++      welded.push_back(a);
++      const uint8_t common = a.edges & b.edges;
++      for (int e = 0; e < 3; ++e) {
++        if ((common & (1u << e)) == 0) {
++          continue;
++        }
++        const uint32_t i = tri[e], j = tri[(e + 1) % 3];
++        const auto found = edgePoints.find(edgeKey(i, j));
++        if (found == edgePoints.end()) {
++          break;
++        }
++        const float ta = along(i, j, a.v.position), tb = along(i, j, b.v.position);
++        const float lo = std::min(ta, tb), hi = std::max(ta, tb), eps = 1e-5f;
++        const size_t from = welded.size();
++        for (const auto& [t, v] : found->second) {
++          if (t > lo + eps && t < hi - eps) {
++            welded.push_back({v, static_cast<uint8_t>(1u << e)});
++          }
++        }
++        // In order from a to b, each once.
++        std::sort(welded.begin() + static_cast<std::ptrdiff_t>(from), welded.end(), [&](const Corner& x, const Corner& y) {
++          const float tx = along(i, j, x.v.position), ty = along(i, j, y.v.position);
++          return ta < tb ? tx < ty : tx > ty;
++        });
++        welded.erase(std::unique(welded.begin() + static_cast<std::ptrdiff_t>(from), welded.end(),
++                                 [&](const Corner& x, const Corner& y) {
++                                   return std::fabs(along(i, j, x.v.position) - along(i, j, y.v.position)) <= eps;
++                                 }),
++                     welded.end());
++        break;
++      }
++    }
++    return welded.size() > n;
++  };
++  // Each ground group again: whole triangles kept (welded where a neighbour was cut), pieces in place
++  // of the cut ones, each at the alpha at its middle.
++  for (size_t g = 0; g < job.groups.size(); ++g) {
++    if (!isGround(job.groups[g])) {
++      continue;
++    }
++    Group& group = job.groups[g];
++    kept.clear();
++    for (size_t it = groupItems[g].first; it < groupItems[g].second; ++it) {
++      const Item& item = items[it];
++      const uint32_t last = std::max({item.tri[0], item.tri[1], item.tri[2]});
++      const bool layered = last < before && std::any_of(plans.begin(), plans.end(), [&](const Plan& plan) {
++                             return last < plan.layer->vertexEnd;
++                           });
++      if (item.first == item.end) {
++        if (layered) {
++          for (uint32_t v : item.tri) {
++            shaded[v] = 1;
++          }
++        }
++        static thread_local std::vector<Corner> whole;
++        bool welds = false;
++        if (layered && !edgePoints.empty()) {
++          whole = {{out.vertices[item.tri[0]], 0b101}, {out.vertices[item.tri[1]], 0b011}, {out.vertices[item.tri[2]], 0b110}};
++          welds = weld(whole, item.tri);
++        }
++        if (!welds) {
++          kept.insert(kept.end(), {item.tri[0], item.tri[1], item.tri[2]});
++          continue;
++        }
++        // Its own corners (shaded in place) and the points cut in from beyond (new, shaded here).
++        static thread_local std::vector<uint32_t> ring;
++        ring.clear();
++        for (const Corner& corner : welded) {
++          uint32_t index = UINT32_MAX;
++          for (int k = 0; k < 3; ++k) {
++            const uint8_t cornerEdges = k == 0 ? 0b101 : k == 1 ? 0b011 : 0b110;
++            if (corner.edges == cornerEdges) {
++              index = item.tri[k];
++            }
++          }
++          if (index == UINT32_MAX) {
++            MirrorVertex v = corner.v;
++            for (const Plan& plan : plans) {
++              if (last < plan.layer->vertexEnd) {
++                apply(plan, v, alphaAt(plan, v.position));
++              }
++            }
++            index = static_cast<uint32_t>(out.vertices.size());
++            out.vertices.push_back(v);
++          }
++          ring.push_back(index);
++        }
++        for (size_t k = 1; k + 1 < ring.size(); ++k) {
++          kept.insert(kept.end(), {ring[0], ring[k], ring[k + 1]});
++        }
++        continue;
++      }
++      for (uint32_t p = item.first; p < item.end; ++p) {
++        const Piece& piece = allPieces[p];
++        ++pieceCount;
++        float middle[3] = {0.f, 0.f, 0.f};
++        for (const Corner& corner : piece.corners) {
++          for (int c = 0; c < 3; ++c) {
++            middle[c] += corner.v.position[c] / static_cast<float>(piece.corners.size());
++          }
++        }
++        alphas.resize(plans.size());
++        for (size_t l = 0; l < plans.size(); ++l) {
++          alphas[l] = last < plans[l].layer->vertexEnd ? alphaAt(plans[l], middle) : 0.f;
++        }
++        const std::vector<Corner>& polygon = weld(piece.corners, piece.tri) ? welded : piece.corners;
++        const auto first = static_cast<uint32_t>(out.vertices.size());
++        for (const Corner& corner : polygon) {
++          MirrorVertex v = corner.v;
++          for (size_t l = 0; l < plans.size(); ++l) {
++            if (last < plans[l].layer->vertexEnd) {
++              apply(plans[l], v, alphas[l]);
++            }
++          }
++          out.vertices.push_back(v);
++        }
++        for (uint32_t k = 1; k + 1 < polygon.size(); ++k) {
++          kept.insert(kept.end(), {first, first + k, first + k + 1});
++        }
++      }
++    }
++    group.indices.swap(kept);
++  }
++  // The whole triangles' corners, each once.
++  for (uint32_t v = 0; v < before; ++v) {
++    if (!shaded[v]) {
++      continue;
++    }
++    ++shadedCount;
++    for (const Plan& plan : plans) {
++      if (v < plan.layer->vertexEnd) {
++        apply(plan, out.vertices[v], alphaAt(plan, out.vertices[v].position));
++      }
++    }
++  }
++  // The translucent draws a multiplying layer darkens in place: their colour (premultiplied: rgb and
++  // what they let through alike) times fd at each vertex, as the ground under them is.
++  for (const Plan& plan : plans) {
++    for (const auto& [first, end] : plan.layer->darken) {
++      for (uint32_t v = first; v < end && v < before; ++v) {
++        MirrorVertex& vertex = out.vertices[v];
++        const float f = std::clamp(alpha_factor(plan.layer->dst, false, plan.layer->alpha, alphaAt(plan, vertex.position)), 0.f, 1.f);
++        for (int c = 0; c < 3; ++c) {
++          vertex.mul[c] = half(from_half(vertex.mul[c]) * f);
++          vertex.add[c] = half(from_half(vertex.add[c]) * f);
++        }
++      }
++    }
++    if (log) {
++      const AlphaLayer& layer = *plan.layer;
++      Log.info("mirror alpha layer: {} operations ({} live), colour ({:.2f} {:.2f} {:.2f}) x {} + dst x {}, alpha {:.2f}; "
++               "away {:.3f}{}, {} volumes, {} translucent ranges darkened",
++               plan.opCount, std::count(plan.live.begin(), plan.live.end(), 1), layer.colour[0], layer.colour[1], layer.colour[2],
++               static_cast<int>(layer.src), static_cast<int>(layer.dst), layer.alpha, plan.away,
++               plan.everywhere ? " (everywhere)" : "", plan.spheres.size(), layer.darken.size());
++    }
++  }
++  g_alphaLayerTriangles += pieceCount;
++  if (log) {
++    Log.info("mirror alpha layers in place: {} volumes cut along, {} triangles cut into {} pieces, {} vertices shaded",
++             cut.size(), cutTriangles, pieceCount, shadedCount);
++  }
++  return out.vertices.size() - before;
++}
++
+ void finish(Job& job) {
+   Built& out = job.built;
+   out.tag = job.tag;
+@@ -3079,6 +3933,8 @@ void finish(Job& job) {
+     const float knee = allowance * 0.5f;
+     const Easing easing{out.plane, k, knee, allowance - knee, out.plane - knee / k};
+     const bool ease = !s_band && window > 0.f && easing.end > 0.f;
++    // 0110: the alpha layers, worked into the ground they lie on (cut where a light meets it).
++    build_alpha_layers(job);
+     std::vector<uint8_t> decal(out.vertices.size(), 0);
+     for (const auto& [first, end] : job.decalRanges) {
+       std::fill(decal.begin() + first, decal.begin() + std::min<size_t>(end, decal.size()), uint8_t{1});
+@@ -3233,6 +4089,9 @@ void publish(bool scene, float focus) {
+       std::swap(g_job.groups, g_groups);
+       std::swap(g_job.backgroundRanges, g_backgroundRanges);
+       std::swap(g_job.decalRanges, g_decalRanges);
++      std::swap(g_job.alphaOps, g_alphaOps);
++      std::swap(g_job.alphaLayers, g_alphaLayers);
++      g_job.alphaStart = g_alphaStart;
+       g_job.farthest = g_farthest;
+       g_job.nearestBackground = g_nearestBackground;
+       g_job.scene = scene;
+@@ -3272,10 +4131,11 @@ void publish(bool scene, float focus) {
+     {
+       const double scenes = static_cast<double>(std::max<uint64_t>(g_scenes.exchange(0), 1));
+       Log.info("mirror: CPU per frame: FIFO thread over the scene {:.2f} ms, finishing {:.2f} ms; {:.2f} bakes "
+-               "({:.0f} texels)",
++               "({:.0f} texels), {:.1f} alpha operations, {:.0f} pieces cut where lights meet the ground",
+                static_cast<double>(g_sceneCpuNanos.exchange(0)) / scenes / 1e6,
+                static_cast<double>(g_finishCpuNanos.exchange(0)) / finished / 1e6, g_stats.bakes / f,
+-               g_stats.bakeTexels / f);
++               g_stats.bakeTexels / f, g_stats.alphaOps / f,
++               static_cast<double>(g_alphaLayerTriangles.exchange(0)) / static_cast<double>(finished));
+     }
+     log_tally(f);
+     Log.info("mirror: glass at {:.0f} (focus {:.0f}), {:.1f}% of vertices moved nearer it (into its band, or "
+@@ -4280,6 +5140,9 @@ bool draw_blob_shadow(const ShaderConfig& config, const MirrorPart& quad) {
+   }
+   std::swap(g_jobs[g_jobCount], g_mask);
+   DrawJob& job = *g_jobs[g_jobCount++];
++  job.alphaOp = -1;
++  job.alphaLayer = -1;
++  job.writesAlpha = false;
+   MirrorPart part{};
+   part.kind = aurora::mirror::PartBlend;
+   part.colourBase = 0.f;
+@@ -4416,6 +5279,159 @@ void trace_draw(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount) {
+   text += fmt::format(" at ({:.0f} {:.0f} {:.0f})", m.m0[3], m.m1[3], m.m2[3]);
+   Log.info("{}", text);
+ }
++// 0110: an empty group of its own in an alpha layer's place (or the alpha's set-up's), which keeps
++// the blended draws on either side of it from merging into one.
++size_t alpha_layer_group() {
++  MirrorPart part{};
++  part.kind = aurora::mirror::PartBlend;
++  part.colourBase = 1.f;
++  part.colourAlpha = 0.f;
++  part.opacityBase = 0.f;
++  part.opacityAlpha = 1.f;
++  part.opacityLuma = 0.f;
++  part.flags = aurora::mirror::PartDepthTest;
++  g_lastBlended = -1; // a group of its own
++  Group& group = group_for(part);
++  g_lastBlended = -1; // and the next draw's not in it
++  return static_cast<size_t>(&group - g_groups.data());
++}
++
++// 0110: a draw on the framebuffer's alpha (see AlphaOp): an alpha-only draw without a texture (a
++// volume, or over the whole picture when flat), or a flat quad blended by the alpha (a layer, and
++// an operation for what it writes in the alpha). True when it was taken as one.
++bool record_alpha(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8* vertices, const u16* indices,
++                  u32 indexCount) {
++  const auto& st = g_gxState;
++  const bool ortho = st.projType == GX_ORTHOGRAPHIC;
++  const bool alphaOnly = !st.colorUpdate && st.alphaUpdate;
++  const bool readsAlpha = st.blendMode == GX_BM_BLEND &&
++                          (st.blendFacSrc == GX_BL_DSTALPHA || st.blendFacSrc == GX_BL_INVDSTALPHA ||
++                           st.blendFacDst == GX_BL_DSTALPHA || st.blendFacDst == GX_BL_INVDSTALPHA);
++  const bool layer = ortho && st.colorUpdate && readsAlpha;
++  if (!(alphaOnly || layer || (ortho && st.alphaUpdate)) || config.lineMode != 0 || st.cullMode == GX_CULL_ALL) {
++    return false;
++  }
++  // Only constants: no texture, no vertex colours.
++  for (u32 i = 0; i < config.tevStageCount; ++i) {
++    if (samples_texture(config.tevStages[i])) {
++      return false;
++    }
++  }
++  if (config.attrs[GX_VA_CLR0].attrType != GX_NONE || config.attrs[GX_VA_CLR1].attrType != GX_NONE) {
++    return false;
++  }
++  if (g_jobCount == g_jobs.size()) {
++    g_jobs.push_back(std::make_unique<DrawJob>());
++  }
++  DrawJob& job = *g_jobs[g_jobCount];
++  job.plan = DrawPlan{};
++  plan_draw(config, job.plan, false);
++  job.state.capture(config);
++  job.config = config;
++  const F4 none[2];
++  F4 raster[2];
++  light(job, none, F3{}, F3{1, 0, 0}, raster);
++  const auto tev = run_tev(job, raster);
++  for (const Sym& c : tev) {
++    if (c.sel >= 0 || c.bsel >= 0) {
++      return false;
++    }
++  }
++  AlphaOp op;
++  op.mode = st.blendMode;
++  op.src = st.blendFacSrc;
++  op.dst = st.blendFacDst;
++  op.alpha = std::clamp(tev[3].c, 0.f, 1.f);
++  op.constant = st.dstAlpha != UINT32_MAX;
++  op.constantAlpha = op.constant ? static_cast<float>(st.dstAlpha & 0xFF) / 255.f : 0.f;
++  op.depthTest = st.depthCompare;
++  op.depthFunc = st.depthFunc;
++  op.front = st.cullMode != GX_CULL_FRONT;
++  op.back = st.cullMode != GX_CULL_BACK;
++  g_mergeTarget = nullptr;
++  g_lastLeftOut = true;
++  if (ortho) {
++    if (layer) {
++      // The layer reads the alpha as it is before this quad writes its own.
++      AlphaLayer made;
++      made.ops = g_alphaOps.size();
++      made.colour[0] = std::clamp(tev[0].c, 0.f, 1.f);
++      made.colour[1] = std::clamp(tev[1].c, 0.f, 1.f);
++      made.colour[2] = std::clamp(tev[2].c, 0.f, 1.f);
++      made.alpha = op.alpha;
++      made.src = st.blendFacSrc;
++      made.dst = st.blendFacDst;
++      // Multiplying: in the place of the quad that set up the alpha it reads, if there's one.
++      int placed = -1;
++      if (made.dst != GX_BL_ONE) {
++        for (size_t i = g_alphaOps.size(); i-- > 0;) {
++          if (g_alphaOps[i].group >= 0) {
++            placed = g_alphaOps[i].group;
++            made.fromJob = g_alphaOps[i].jobs;
++            g_alphaOps[i].group = -1;
++            break;
++          }
++        }
++      }
++      made.toJob = g_jobCount;
++      made.group = placed >= 0 ? static_cast<size_t>(placed) : alpha_layer_group();
++      queue_open_job();
++      job.alphaOp = -1;
++      job.alphaLayer = static_cast<int>(g_alphaLayers.size());
++      job.vtxCount = 0;
++      job.bytes.clear();
++      job.indices.clear();
++      job.segments.clear();
++      job.group = made.group;
++      g_alphaLayers.push_back(made);
++      ++g_jobCount; // in the frame's order; nothing to decode
++    }
++    if (st.alphaUpdate) {
++      op.screen = true;
++      // Setting the alpha over the whole picture: a place for a layer that multiplies by it.
++      if (op.constant || op.mode == GX_BM_NONE) {
++        op.jobs = g_jobCount;
++        op.group = static_cast<int>(alpha_layer_group());
++      }
++      g_alphaOps.push_back(std::move(op));
++    }
++    return true;
++  }
++  if (!alphaOnly) {
++    return false;
++  }
++  // A volume: decoded on a worker as a draw is, kept out of the picture (merge_jobs).
++  job.alphaOp = static_cast<int>(g_alphaOps.size());
++  job.alphaLayer = -1;
++  g_alphaOps.push_back(std::move(op));
++  job.prim = prim;
++  job.vtxCount = vtxCount;
++  job.bytes.assign(vertices, vertices + static_cast<size_t>(vtxCount) * config.vtxStride);
++  if (indices != nullptr) {
++    job.indices.assign(indices, indices + indexCount);
++  } else {
++    job.indices.clear();
++  }
++  job.segments.clear();
++  job.behind = false;
++  job.background = false;
++  job.perVertex = false;
++  job.constantResult = tev;
++  job.channelSel = {-1, -1, -1, -1};
++  job.pull = 0.f;
++  job.baked = false;
++  job.decal = false;
++  job.nearer = 1.f;
++  job.group = 0;
++  job.nearClip = 1.f;
++  job.kx = job.ky = 1.f;
++  ++g_jobCount;
++  queue_open_job();
++  g_openJob = &job;
++  g_mergeTarget = job.indices.empty() ? &job : nullptr;
++  g_lastLeftOut = false;
++  return true;
++}
+ 
+ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8* vertices, const u16* indices,
+             u32 indexCount, bool merged) noexcept {
+@@ -4510,6 +5526,15 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+   } timer;
+   const auto& st = g_gxState;
+   ++g_stats.draws;
++  // A blob shadow's alpha-only draws (0109), noted before the alpha's own record takes the volume.
++  if (kBlobShadows && !st.colorUpdate && st.alphaUpdate && config.lineMode == 0 && st.projType != GX_ORTHOGRAPHIC &&
++      st.proj.m0[0] > 0.f && st.proj.m1[1] > 0.f) {
++    note_alpha_draw(prim, config, vtxCount, vertices, indices, indexCount);
++  }
++  if (kAlphaBuffer && record_alpha(prim, config, vtxCount, vertices, indices, indexCount)) {
++    ++g_stats.alphaOps;
++    return;
++  }
+   if (config.lineMode != 0) {
+     ++g_stats.lines;
+     tally(TallyLines);
+@@ -4521,10 +5546,7 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+     return;
+   }
+   if (!st.colorUpdate) {
+-    if (kBlobShadows && st.alphaUpdate) {
+-      note_alpha_draw(prim, config, vtxCount, vertices, indices, indexCount);
+-    }
+-    ++g_stats.noColour;
++    ++g_stats.noColour; // (a blob's alpha-only draws noted above)
+     tally(TallyNoColour);
+     return;
+   }
+@@ -4669,6 +5691,9 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+   }
+ 
+   DrawJob& job = *g_jobs[g_jobCount++];
++  job.alphaOp = -1;
++  job.alphaLayer = -1;
++  job.writesAlpha = st.alphaUpdate;
+   tally(TallyKept);
+   log_textures(config, plan, part, vtxCount);
+   job.state.capture(config);

@@ -37,6 +37,10 @@
 #include "d/actor/d_a_canon.h"
 #include "d/actor/d_a_hookshot.h"
 #include "d/actor/d_a_ship.h"
+#if COS_VISIONOS
+#include "wwvr_vr.h" // visionos/host: the head-tracked view in Full and Progressive
+#include "wwvr_window.h" // visionos/host: the Window view's wider view in 3D
+#endif
 #if TARGET_PC
 #include "pc/pc_controls.h"
 
@@ -46,6 +50,9 @@
 // and the figure viewer read the C stick themselves and keep its real directions. Every
 // CPad_GET_SUBSTICK_POS_X/Y below this point reads through these.
 static inline f32 dCamera_cStickX(int padId) {
+#if COS_VISIONOS
+    wwvr_window_sync_camera_invert(); // the launcher's choice, changed while playing
+#endif
     if (pc_camera_invert_x()) {
         return -CPad_GET_SUBSTICK_POS_X(padId);
     }
@@ -7868,6 +7875,13 @@ s16 dCam_getAngleX(camera_class* i_this) {
 
 /* 8017BDC8-8017BDEC       .text dCam_getControledAngleY__FP12camera_class */
 s16 dCam_getControledAngleY(camera_class* i_this) {
+#if COS_VISIONOS
+    // VR: Link walks the way the head looks (wwvr_vr.h).
+    s16 vrYaw;
+    if (wwvr_vr_control_yaw(&vrYaw)) {
+        return vrYaw;
+    }
+#endif
     return ((camera_process_class*)i_this)->mCamera.U2();
 }
 
@@ -7905,6 +7919,22 @@ static void preparation(camera_process_class* i_this) {
     dComIfGp_offCameraAttentionStatus(camera_id, dCamAttnStts_00000001_e | dCamAttnStts_SUBJECT_e | dCamAttnStts_00000020_e);
 }
 
+#if COS_VISIONOS
+// First person (the picto box, the telescope, aiming): the camera's subject status, or its subject
+// style (the status alone depends on who set it when in the frame).
+static bool wwvr_first_person(camera_process_class* i_this) {
+    dCamera_c& body = i_this->mCamera;
+    return dComIfGp_checkCameraAttentionStatus(get_camera_id((camera_class*)i_this), dCamAttnStts_SUBJECT_e) ||
+           (body.mCurStyle >= 0 && body.mCamParam.Algorythmn(body.mCurStyle) == dCamAlg_SUBJECT_CAMERA_e);
+}
+
+// An event's camera (a cutscene, a close-up, framed by the game): the window keeps its aim.
+static bool wwvr_event_camera(camera_process_class* i_this) {
+    dCamera_c& body = i_this->mCamera;
+    return dComIfGp_evmng_cameraPlay() || body.chkFlag(0x20000000) || body.mCurType == body.mCamTypeEvent;
+}
+#endif
+
 /* 8017BEB0-8017BFAC       .text view_setup__FP20camera_process_class */
 static void view_setup(camera_process_class* i_this) {
     camera_class* a_this = (camera_class*)i_this;
@@ -7912,6 +7942,9 @@ static void view_setup(camera_process_class* i_this) {
 
     view_port_class* viewport = window->getViewPort();
     view_class* view = (view_class*)i_this;
+#if COS_VISIONOS
+    wwvr_vr_camera(view); // VR: the head-tracked view (wwvr_vr.h)
+#endif
     mDoMtx_lookAt(view->mViewMtx, &view->mLookat.mEye, &view->mLookat.mCenter, &view->mLookat.mUp, view->mBank);
     MTXCopy(view->mViewMtx, view->mViewMtxNoTrans);
 
@@ -7931,6 +7964,26 @@ static void view_setup(camera_process_class* i_this) {
     }
 
     mDoLib_clipper::setup(view->mFovy, view->mAspect, view->mNear, far);
+#if COS_VISIONOS
+    // The Window view in 3D draws wider than its picture (wwvr_window.h): culled as wide. (The far
+    // distances setup works out from the view angle stay the game's own.) Not in first person.
+    wwvr_window_take_view_scale(wwvr_first_person(i_this));
+    wwvr_window_set_event_camera(wwvr_event_camera(i_this));
+    // The player, for the window's near field: how near the camera he is, and the ground at his
+    // feet (wwvr_window.h).
+    fopAc_ac_c* player = dComIfGp_getPlayer(0);
+    if (player != NULL) {
+        wwvr_window_set_player(true, player->current.pos.x, player->current.pos.y, player->current.pos.z,
+                               player->eyePos.y);
+    } else {
+        wwvr_window_set_player(false, 0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    const f32 wide = wwvr_window_fovy(view->mFovy, false);
+    if (wide != view->mFovy) {
+        mDoLib_clipper::mClipper.setFovy(wide);
+        mDoLib_clipper::mClipper.calcViewFrustum();
+    }
+#endif
 }
 
 /* 8017BFAC-8017C29C       .text store__FP20camera_process_class */
@@ -8053,7 +8106,20 @@ static bool camera_draw(camera_process_class* i_this) {
     // Debug harness (bug B7): COS_CAMERA / COS_SMOKE=shore-foam hold a fixed view.
     pc_camera_override(&i_this->view.mLookat.mEye.x, &i_this->view.mLookat.mCenter.x);
 #endif
+#if COS_VISIONOS
+    wwvr_vr_camera_draw(&i_this->view); // VR: the head-tracked view the draw lists are made with
+#endif
+#if COS_VISIONOS
+    // The Window view in 3D: drawn wider than its picture (wwvr_window.h), unless first person began
+    // since view_setup (culled wider than drawn then, which shows nothing missing).
+    if (wwvr_first_person(i_this)) {
+        wwvr_window_take_view_scale(true);
+    }
+    C_MTXPerspective(i_this->view.mProjMtx, wwvr_window_fovy(i_this->view.mFovy, true), i_this->view.mAspect,
+                     i_this->view.mNear, i_this->view.mFar);
+#else
     C_MTXPerspective(i_this->view.mProjMtx, i_this->view.mFovy, i_this->view.mAspect, i_this->view.mNear, i_this->view.mFar);
+#endif
     mDoMtx_lookAt(i_this->view.mViewMtx, &i_this->view.mLookat.mEye, &i_this->view.mLookat.mCenter, &i_this->view.mLookat.mUp, i_this->view.mBank);
 
     j3dSys.setViewMtx(i_this->view.mViewMtx);

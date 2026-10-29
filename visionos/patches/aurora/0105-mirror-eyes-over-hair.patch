@@ -1,0 +1,389 @@
+diff --git a/lib/gx/mirror.cpp b/lib/gx/mirror.cpp
+index fbfda03..acbdef2 100644
+--- a/lib/gx/mirror.cpp
++++ b/lib/gx/mirror.cpp
+@@ -664,8 +664,22 @@ struct LookupPixels {
+ };
+ std::unordered_map<uint64_t, std::shared_ptr<const LookupPixels>> g_lookupPixels; // FIFO thread
+ constexpr uint32_t kLookupMaxTexels = 256 * 256;
++
++// 0105: two textures a draw multiplies (an eye: its white and pupil, scrolled by a texture matrix, times
++// its outline and shape), baked into one at the base's size, under an id per draw of the frame (the
++// n-th of these two textures): baked again, in place, only when the scroll or the TEV's constants
++// change.
++struct Baked {
++  uint64_t id = 0;
++  uint64_t key = 0; // what it was baked from
++  uint32_t lastFrame = 0;
++};
++std::unordered_map<uint64_t, Baked> g_baked;           // FIFO thread
++std::unordered_map<uint64_t, unsigned> g_bakeOccurrences; // this frame's, by texture pair
++
+ void forget_textures() {
+   g_lookupPixels.clear();
++  g_baked.clear();
+   g_textures.clear();
+   g_copySlots.clear();
+   g_variants.clear();
+@@ -707,6 +721,14 @@ void sweep_textures(bool all = false) {
+       ++it;
+     }
+   }
++  for (auto it = g_baked.begin(); it != g_baked.end();) {
++    if (all || g_frame - it->second.lastFrame > 900) {
++      g_removedTextures.push_back(it->second.id);
++      it = g_baked.erase(it);
++    } else {
++      ++it;
++    }
++  }
+ }
+ 
+ // A lookup's pixels (decoded once, then kept), or null for one too big to read on the CPU.
+@@ -1325,6 +1347,9 @@ bool switch_on(const char* name) {
+   return value == nullptr || std::strcmp(value, "0") != 0;
+ }
+ const bool kLookups = switch_on("AURORA_MIRROR_LOOKUPS");
++// 0105 test switch: AURORA_MIRROR_OVER_HAIR=0 reads the eyes' blend as before (additive), with no
++// bake.
++const bool kOverHair = switch_on("AURORA_MIRROR_OVER_HAIR");
+ 
+ bool colour_coord(const ShaderConfig& config, int coord) {
+   if (coord < 0 || coord >= static_cast<int>(MaxTexCoord)) {
+@@ -1333,6 +1358,7 @@ bool colour_coord(const ShaderConfig& config, int coord) {
+   const TcgConfig& tcg = config.tcgs[coord];
+   return tcg.src == GX_TG_COLOR0 || tcg.src == GX_TG_COLOR1;
+ }
++
+ // Which texture the mirror keeps, the others' averages, and a framebuffer copy it samples.
+ // How much a texture shows of what a draw looks like, to pick the one the mirror keeps: a colour
+ // picture over an intensity mask, mapped by the model's own coordinates over a projection.
+@@ -1753,6 +1779,10 @@ struct DrawJob {
+   float nearer = 1.f;
+   // A decal: lifted towards the camera too, by 0.4% of its distance but at most kDecalLift.
+   bool decal = false;
++  // 0105: drawn this much nearer the camera (game units: an eye over the hair), and the texture is
++  // a bake of the TEV's whole result (its colour and alpha as they are).
++  float pull = 0.f;
++  bool baked = false;
+   // Out: its vertices (clipping adds some) and triangles into them, wound for RealityKit.
+   std::vector<MirrorVertex> vertices;
+   std::vector<uint32_t> triangles;
+@@ -1784,8 +1814,9 @@ void light(const DrawJob& job, const F4 colours[2], F3 view, F3 normal, F4 raste
+ }
+ 
+ // The TEV stages with T (and B) unknown, from a vertex's colour channels.
+-// lookups (0104): per map, its sample at this vertex (plan.lookups); null: averages.
+-std::array<Sym, 4> run_tev(const DrawJob& job, const F4 raster[2], const F4* lookups = nullptr) {
++// lookups (0104): per map, its sample at this vertex (plan.lookups); null: averages. With
++// `allKnown` (0105), the primary map's too (the stages are then all constants: baking).
++std::array<Sym, 4> run_tev(const DrawJob& job, const F4 raster[2], const F4* lookups = nullptr, bool allKnown = false) {
+   const auto& config = job.config;
+   const auto& plan = job.plan;
+   const auto& stages = config.tevStages;
+@@ -1811,8 +1842,9 @@ std::array<Sym, 4> run_tev(const DrawJob& job, const F4 raster[2], const F4* loo
+         return constant(1.f);
+       }
+       const int from = texChannel[channel];
+-      if (lookups != nullptr && stage.texMapId < MaxTextures && !primaryStage && plan.lookups[stage.texMapId].pixels &&
+-          plan.lookups[stage.texMapId].coord == static_cast<int>(stage.texCoordId)) {
++      if (lookups != nullptr && stage.texMapId < MaxTextures &&
++          (allKnown || (!primaryStage && plan.lookups[stage.texMapId].pixels &&
++                        plan.lookups[stage.texMapId].coord == static_cast<int>(stage.texCoordId)))) {
+         return constant(lookups[stage.texMapId][from]);
+       }
+       if (primaryStage) {
+@@ -1953,12 +1985,29 @@ float decode_vertex(DrawJob& job, const Decoder& decoder, uint32_t v) {
+   out.position[0] = view.x;
+   out.position[1] = view.y;
+   out.position[2] = view.z;
+-  if (plan.primary != nullptr) {
++  if (job.pull > 0.f) {
++    // 0105: drawn over the hair (an eye): this much nearer the camera along its line of sight.
++    const float distance = std::sqrt(dot(view, view));
++    const float scale = distance > 1e-3f ? std::max(0.25f, 1.f - job.pull / distance) : 1.f;
++    for (float& c : out.position) {
++      c *= scale;
++    }
++  }
++  if (plan.primary != nullptr || job.baked) {
+     const auto uv = tex_coord(st, decoder, config, plan.primaryCoord, v, position,
+                               F3{rawNormal[0], rawNormal[1], rawNormal[2]}, plan.colourCoords ? raster : colours);
+     out.uv[0] = std::isfinite(uv[0]) ? uv[0] : 0.f;
+     out.uv[1] = std::isfinite(uv[1]) ? uv[1] : 0.f;
+   }
++  if (job.baked) {
++    // 0105: the baked texture is the TEV's whole result; only the fog is per vertex.
++    for (int c = 0; c < 4; ++c) {
++      const bool fogged = c < 3 && fog > 0.f;
++      out.mul[c] = half(fogged ? 1.f - fog : 1.f);
++      out.add[c] = half(fogged ? fog * st.fog.color[c] : 0.f);
++    }
++    return std::sqrt(dot(view, view));
++  }
+   float transmitted = 0.f; // B's mean weight (a refracting surface's transparency)
+   for (int c = 0; c < 4; ++c) {
+     Sym s = result[c];
+@@ -2376,6 +2425,7 @@ void log_skipped(const ShaderConfig& config, const MirrorPart& part, u16 vtxCoun
+ }
+ 
+ void begin_frame() {
++  g_bakeOccurrences.clear();
+   g_passes.clear();
+   g_building.vertices.clear();
+   g_groups.clear();
+@@ -2846,6 +2896,197 @@ void debug_group(const std::string* label) noexcept {
+   }
+ }
+ 
++// 0105: how much nearer the camera an eye drawn over the hair is put (game units; Wind Waker's are
++// about a centimetre): past the hair in front of the face, short of what stands in front of the
++// character.
++constexpr float kOverHairPull = 10.f;
++
++// A texture coordinate made from the vertices' own (one of GX_TG_TEX0..7) by a 2x4 matrix, as the
++// affine map (s, t) -> (u, v): u = a0 s + a1 t + a2, v = a3 s + a4 t + a5. False for any other
++// kind (projected, normalised, post-transformed, a matrix per vertex).
++bool coord_affine(const DrawJob& job, int coord, std::array<float, 6>& a, int* source) {
++  const ShaderConfig& config = job.config;
++  if (coord < 0 || coord >= static_cast<int>(MaxTexCoord)) {
++    return false;
++  }
++  const TcgConfig& tcg = config.tcgs[coord];
++  if (tcg.type != GX_TG_MTX2x4 || tcg.src < GX_TG_TEX0 || tcg.src > GX_TG_TEX7 || tcg.normalize ||
++      tcg.postMtx != GX_PTIDENTITY || config.attrs[GX_VA_TEX0MTXIDX + coord].attrType != GX_NONE) {
++    return false;
++  }
++  *source = tcg.src;
++  if (tcg.mtx == GX_IDENTITY) {
++    a = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f};
++    return true;
++  }
++  const auto& m = postex_matrix(job.state, tcg.mtx / 3);
++  // (s, t, 1, 1): the matrix's last two columns both add.
++  a = {m.m0[0], m.m0[1], m.m0[2] + m.m0[3], m.m1[0], m.m1[1], m.m1[2] + m.m1[3]};
++  return true;
++}
++
++// 0105: a draw that multiplies two textures (Wind Waker's eye: its white and pupil, scrolled by a
++// texture matrix as the eye looks around, times its outline, whose alpha is the eye's shape) keeps
++// one; the other stood in as its average, so the eye lost its shape or its pupil. Here both are
++// baked into one texture at the size of the one read as it is (the base), the other read through
++// the map between their coordinates. The TEV is taken as linear in each sample (five runs with the
++// other texture at zero and at each channel, the kept one left unknown), which a product of the two
++// is. Under an id per pair and per draw of the frame, baked again in place only when the map or the
++// TEV changes. Only for draws with no raster colour (their TEV is the textures alone).
++bool bake_pair(DrawJob& job, MirrorPart& part) {
++  DrawPlan& plan = job.plan;
++  const ShaderConfig& config = job.config;
++  if (plan.primary == nullptr || plan.primary->captured || plan.behindMap >= 0 || plan.anyLookup ||
++      plan.rasterUsed[0] || plan.rasterUsed[1]) {
++    return false;
++  }
++  int other = -1, otherCoord = -1;
++  for (u32 i = 0; i < config.tevStageCount; ++i) {
++    const TevStage& stage = config.tevStages[i];
++    if (!samples_texture(stage) || stage.texMapId >= MaxTextures || static_cast<int>(stage.texMapId) == plan.primaryMap) {
++      continue;
++    }
++    if ((other >= 0 && static_cast<int>(stage.texMapId) != other) ||
++        (otherCoord >= 0 && static_cast<int>(stage.texCoordId) != otherCoord)) {
++      return false; // a third texture, or one read two ways
++    }
++    other = stage.texMapId;
++    otherCoord = stage.texCoordId;
++  }
++  if (other < 0) {
++    return false;
++  }
++  // The primary's coordinate must be the one every one of its stages reads.
++  for (u32 i = 0; i < config.tevStageCount; ++i) {
++    const TevStage& stage = config.tevStages[i];
++    if (samples_texture(stage) && static_cast<int>(stage.texMapId) == plan.primaryMap &&
++        static_cast<int>(stage.texCoordId) != plan.primaryCoord) {
++      return false;
++    }
++  }
++  const GXTexObj_& primaryObj = g_gxState.loadedTextures[plan.primaryMap];
++  const GXTexObj_& otherObj = g_gxState.loadedTextures[other];
++  TexEntry* otherEntry = texture_entry(otherObj);
++  if (otherEntry == nullptr || !otherEntry->ok || otherEntry->captured) {
++    return false;
++  }
++  std::array<float, 6> primaryMap{}, otherMap{};
++  int primarySource = -1, otherSource = -1;
++  if (!coord_affine(job, plan.primaryCoord, primaryMap, &primarySource) ||
++      !coord_affine(job, otherCoord, otherMap, &otherSource) || primarySource != otherSource) {
++    return false;
++  }
++  const auto primaryPixels = lookup_pixels(*plan.primary, primaryObj);
++  const auto otherPixels = lookup_pixels(*otherEntry, otherObj);
++  if (!primaryPixels || !otherPixels) {
++    return false;
++  }
++  // The base: the one read without a matrix (the shape), else the other.
++  const bool primaryBase = primaryMap == std::array<float, 6>{1.f, 0.f, 0.f, 0.f, 1.f, 0.f} &&
++                           otherMap != std::array<float, 6>{1.f, 0.f, 0.f, 0.f, 1.f, 0.f};
++  const std::array<float, 6>& baseMap = primaryBase ? primaryMap : otherMap;
++  const std::array<float, 6>& readMap = primaryBase ? otherMap : primaryMap;
++  const float det = baseMap[0] * baseMap[4] - baseMap[1] * baseMap[3];
++  if (std::fabs(det) < 1e-8f) {
++    return false;
++  }
++  // The read texture's coordinate from the base's: M = read o base^-1.
++  const float i0 = baseMap[4] / det, i1 = -baseMap[1] / det, i3 = -baseMap[3] / det, i4 = baseMap[0] / det;
++  const float i2 = -(i0 * baseMap[2] + i1 * baseMap[5]), i5 = -(i3 * baseMap[2] + i4 * baseMap[5]);
++  const std::array<float, 6> m{readMap[0] * i0 + readMap[1] * i3,  readMap[0] * i1 + readMap[1] * i4,
++                               readMap[0] * i2 + readMap[1] * i5 + readMap[2],
++                               readMap[3] * i0 + readMap[4] * i3,  readMap[3] * i1 + readMap[4] * i4,
++                               readMap[3] * i2 + readMap[4] * i5 + readMap[5]};
++  // The TEV with the other texture known: at zero, and at each channel alone.
++  plan.lookups[other].pixels = otherPixels;
++  plan.lookups[other].coord = otherCoord;
++  const F4 raster[2];
++  F4 lookups[MaxTextures];
++  std::array<std::array<Sym, 4>, 5> probes;
++  for (int j = 0; j < 5; ++j) {
++    lookups[other] = {};
++    if (j > 0) {
++      lookups[other][j - 1] = 1.f;
++    }
++    probes[j] = run_tev(job, raster, lookups);
++  }
++  plan.lookups[other] = {};
++  // What it's baked from.
++  struct Key {
++    uint64_t primary, other;
++    float m[6];
++    float k[5][4], c[5][4];
++    int8_t sel[5][4];
++    bool primaryBase;
++  } key;
++  std::memset(&key, 0, sizeof key); // (the hash reads its padding too)
++  key.primary = plan.primary->id;
++  key.other = otherEntry->id;
++  std::copy(m.begin(), m.end(), key.m);
++  for (int j = 0; j < 5; ++j) {
++    for (int c = 0; c < 4; ++c) {
++      key.k[j][c] = probes[j][c].sel >= 0 ? probes[j][c].k : 0.f;
++      key.c[j][c] = probes[j][c].c;
++      key.sel[j][c] = probes[j][c].sel;
++    }
++  }
++  key.primaryBase = primaryBase;
++  const uint64_t keyHash = xxh3_hash_s(&key, sizeof key);
++  const uint64_t pair[2] = {key.primary, key.other};
++  const uint64_t pairHash = xxh3_hash_s(pair, sizeof pair);
++  const uint64_t slot[2] = {pairHash, g_bakeOccurrences[pairHash]++};
++  Baked& baked = g_baked[xxh3_hash_s(slot, sizeof slot)];
++  if (baked.id == 0) {
++    baked.id = g_nextTextureId++;
++  }
++  baked.lastFrame = g_frame;
++  const LookupPixels& base = primaryBase ? *primaryPixels : *otherPixels;
++  const LookupPixels& read = primaryBase ? *otherPixels : *primaryPixels;
++  const uint8_t readWrapS = static_cast<uint8_t>(primaryBase ? otherObj.wrap_s() : primaryObj.wrap_s());
++  const uint8_t readWrapT = static_cast<uint8_t>(primaryBase ? otherObj.wrap_t() : primaryObj.wrap_t());
++  if (baked.key != keyHash) {
++    baked.key = keyHash;
++    std::vector<uint8_t> rgba(static_cast<size_t>(base.width) * base.height * 4);
++    for (uint32_t y = 0; y < base.height; ++y) {
++      for (uint32_t x = 0; x < base.width; ++x) {
++        const float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(base.width);
++        const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(base.height);
++        const auto sampled = sample_lookup(read, m[0] * u + m[1] * v + m[2], m[3] * u + m[4] * v + m[5], readWrapS, readWrapT);
++        const uint8_t* texel = &base.rgba[(static_cast<size_t>(y) * base.width + x) * 4];
++        std::array<float, 4> own{texel[0] / 255.f, texel[1] / 255.f, texel[2] / 255.f, texel[3] / 255.f};
++        const std::array<float, 4>& tp = primaryBase ? own : sampled;
++        const std::array<float, 4>& to = primaryBase ? sampled : own;
++        uint8_t* out = &rgba[(static_cast<size_t>(y) * base.width + x) * 4];
++        for (int c = 0; c < 4; ++c) {
++          float value = probes[0][c].c, k = probes[0][c].sel >= 0 ? probes[0][c].k : 0.f;
++          int sel = probes[0][c].sel;
++          for (int j = 1; j < 5; ++j) {
++            value += (probes[j][c].c - probes[0][c].c) * to[j - 1];
++            const float kj = probes[j][c].sel >= 0 ? probes[j][c].k : 0.f;
++            k += (kj - (probes[0][c].sel >= 0 ? probes[0][c].k : 0.f)) * to[j - 1];
++            if (sel < 0) {
++              sel = probes[j][c].sel;
++            }
++          }
++          if (sel >= 0) {
++            value += k * tp[sel];
++          }
++          out[c] = static_cast<uint8_t>(std::lround(std::clamp(value, 0.f, 1.f) * 255.f));
++        }
++      }
++    }
++    const bool cutout = binary_alpha(rgba);
++    g_newTextures.push_back({baked.id, std::move(rgba), base.width, base.height, false, cutout});
++  }
++  part.texture = baked.id;
++  const GXTexObj_& baseObj = primaryBase ? primaryObj : otherObj;
++  part.wrapS = static_cast<uint8_t>(std::min<int>(baseObj.wrap_s(), 2));
++  part.wrapT = static_cast<uint8_t>(std::min<int>(baseObj.wrap_t(), 2));
++  plan.primaryCoord = primaryBase ? plan.primaryCoord : otherCoord;
++  job.baked = true;
++  return true;
++}
++
+ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8* vertices, const u16* indices,
+             u32 indexCount) noexcept {
+   if (!g_recording || g_offscreen > 0 || vtxCount == 0) {
+@@ -2897,6 +3138,22 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+     tally(TallyBlend);
+     return;
+   }
++  // 0105: Wind Waker draws eyes and eyebrows over the hair. A mask of where they're in view goes
++  // into the framebuffer's alpha first (colour off: not mirrored), then the eye, with no depth test,
++  // blended by that alpha (dst alpha, 1 - dst alpha). Read as GX's factors that was an additive
++  // blend, and the dark eyes vanished. The mask is the eye's own alpha where nothing nearer hides it:
++  // a plain alpha blend, tested against depth from kOverHairPull nearer (decode_vertex), so the hair
++  // in front of the face doesn't hide it and what stands in front of the character still does.
++  const bool overHair = kOverHair && st.blendMode == GX_BM_BLEND && st.blendFacSrc == GX_BL_DSTALPHA &&
++                        st.blendFacDst == GX_BL_INVDSTALPHA && !(st.depthCompare && st.depthFunc != GX_ALWAYS);
++  if (overHair) {
++    part.kind = aurora::mirror::PartBlend;
++    part.colourBase = 0.f;
++    part.colourAlpha = 1.f;
++    part.opacityBase = 0.f;
++    part.opacityAlpha = 1.f;
++    part.opacityLuma = 0.f;
++  }
+   const float threshold = alpha_threshold(config.alphaCompare);
+   if (threshold > 1.f) {
+     ++g_stats.alphaNever;
+@@ -2913,7 +3170,7 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+     }
+     part.cutoff = threshold;
+   }
+-  const bool depthTest = st.depthCompare && st.depthFunc != GX_ALWAYS;
++  const bool depthTest = (st.depthCompare && st.depthFunc != GX_ALWAYS) || overHair;
+   if (depthTest) {
+     part.flags |= aurora::mirror::PartDepthTest;
+   }
+@@ -2998,6 +3255,8 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+   // Without vertex colours, lighting or lookups, every vertex's TEV result is the same: run it once.
+   job.perVertex = config.attrs[GX_VA_CLR0].attrType != GX_NONE || config.attrs[GX_VA_CLR1].attrType != GX_NONE ||
+                   plan.anyLookup;
++  job.pull = overHair ? kOverHairPull : 0.f;
++  job.baked = false;
+   for (int c = 0; c < 2; ++c) {
+     job.perVertex = job.perVertex || (plan.rasterUsed[c] && (st.colorChannelConfig[c].lightingEnabled ||
+                                                              st.colorChannelConfig[c + GX_ALPHA0].lightingEnabled));
+@@ -3014,8 +3273,13 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+   if (behind) {
+     job.channelSel[3] = -1; // alpha carries the opacity
+   }
+-  // The texture as the TEV reads it.
+-  if (plan.primary != nullptr) {
++  // 0105: an eye's two textures, baked into one.
++  if (overHair && bake_pair(job, part)) {
++    for (int c = 0; c < 4; ++c) {
++      job.channelSel[c] = static_cast<int8_t>(c);
++    }
++  } else if (plan.primary != nullptr) {
++    // The texture as the TEV reads it.
+     uint8_t swizzle = 0;
+     for (int c = 0; c < 4; ++c) {
+       const int from = job.channelSel[c] >= 0 ? job.channelSel[c] : c;

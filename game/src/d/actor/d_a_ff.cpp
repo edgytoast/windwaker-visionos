@@ -47,7 +47,14 @@ static void z_check(ff_class* i_this, cXyz* param_2) {
         i_this->mbNotVisibleZ = 1;
     } else {
         GXDrawDone();
+#if COS_VISIONOS
+        // A place in the picture, peeked at the drawn frame's (the Window view's wider 3D).
+        f32 peekX = param_2->x, peekY = param_2->y;
+        mDoLib_pictureToDrawn(&peekX, &peekY);
+        GXPeekZ((u16)peekX, (u16)peekY, &local_28);
+#else
         GXPeekZ((u16)param_2->x, (u16)param_2->y, &local_28);
+#endif
         f32 fVar1 = 0.5f - param_2->z * -1.0f;
         if (fVar1 < 0.0f) {
             fVar1 = 0.0f;

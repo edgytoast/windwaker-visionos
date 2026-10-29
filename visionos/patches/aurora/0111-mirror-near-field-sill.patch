@@ -1,0 +1,501 @@
+diff --git a/include/aurora/mirror.h b/include/aurora/mirror.h
+index d92cf44..b809fd0 100644
+--- a/include/aurora/mirror.h
++++ b/include/aurora/mirror.h
+@@ -85,8 +85,10 @@ struct Frame {
+   float tanHalfX, tanHalfY; // the scene projection's half-view tangents
+   float focus;              // the camera's distance to what it looks at (view units)
+   // Where a window showing the frame should put its glass (view units): a little short of the
+-  // focus. What's nearer comes out in front of it, eased into the window's allowance
+-  // (set_front_allowance) along its own line of sight, so the picture from the camera is unchanged.
++  // focus, and no farther than the sill (0111: MarkSill) unless that's nearer than a fifth of the
++  // focus, following it over a second. What's nearer comes out in front of it as the shape it is,
++  // and what would come out past the window's allowance (set_front_allowance) is cut there, as a
++  // near plane cuts.
+   float plane;
+   // Textures new since the last acquire, and ones no longer used. A texture whose id was sent
+   // before is new pixels for it (a shadow, read back from the GPU each frame): replace it in place.
+@@ -99,6 +101,21 @@ struct Frame {
+ // The view-scale mark (GXAuroraMirrorMark; GXAurora.h has 1 to 3): how much wider than its picture
+ // the frame is drawn (value: the scale), so the tangents reported are the picture's.
+ inline constexpr uint32_t MarkViewScale = 4u;
++// 0111: the sill mark, before END: the view depth where the line of sight through the middle of the
++// window's foot meets the ground the player stands on (the window's re-aimed view; 0 for none). The
++// glass comes no farther than it (finish), so the ground there lies on the glass, never in front,
++// unless the sill is nearer than a fifth of the focus (the glass's floor).
++inline constexpr uint32_t MarkSill = 5u;
++// 0111: the subject mark, before END: the nearest view depth of the player (0 for none), whom the
++// window keeps whole: the glass comes to him when he's nearer than its cut would keep (finish).
++inline constexpr uint32_t MarkSubject = 6u;
++// 0111: the framed mark, before END: 1 when the frame's camera frames its own subject (an event's: a
++// close-up whose focus can lie far behind the face it frames), 0 otherwise. The window then keeps
++// whole what lies nearest in the middle of the picture, as it keeps the player.
++inline constexpr uint32_t MarkFramed = 7u;
++// 0111: the cut mark, before END: 1 when the camera cut since the frame before (it looks elsewhere,
++// or its eye jumped), 0 otherwise. The glass then goes where it's going at once (finish).
++inline constexpr uint32_t MarkCut = 8u;
+ 
+ // Whether to record (any thread). Turning it on starts the textures over: each is sent again.
+ void set_enabled(bool enabled) noexcept;
+@@ -107,8 +124,9 @@ bool enabled() noexcept;
+ // How far in front of its glass the window showing the frames lets them come out, in window widths
+ // (any thread; 0, the default: no limit), and how far in front of the glass the window puts the
+ // camera, in window widths (0: where the view puts it, 1 / (2 tan); further out, depths are scaled
+-// so the picture from there is the same, which the window's scale of depth has to match). Nearer
+-// geometry eases into the allowance from half of it.
++// so the picture from there is the same, which the window's scale of depth has to match). What
++// would come out past the allowance is cut, as a near plane cuts (0111; AURORA_MIRROR_NEAR=ease
++// eases nearer geometry into it from half of it instead, as before).
+ void set_front_allowance(float widths, float cameraWidths) noexcept;
+ 
+ // The newest recorded frame whose tag is no later than `upTo` (the game frame the caller shows
+diff --git a/lib/gx/mirror.cpp b/lib/gx/mirror.cpp
+index 3079236..c0c4403 100644
+--- a/lib/gx/mirror.cpp
++++ b/lib/gx/mirror.cpp
+@@ -418,7 +418,15 @@ int g_offscreen = 0;
+ // after BEGIN): the frame's view tangents are the picture's, so the window lays the scene out as the
+ // 2D picture is framed, and what the wider view adds lies past the picture's edges.
+ constexpr u32 kMarkViewScale = ::aurora::mirror::MarkViewScale; // visionos/host/wwvr_window.cpp sends it
++constexpr u32 kMarkSill = ::aurora::mirror::MarkSill;           // 0111: and these
++constexpr u32 kMarkSubject = ::aurora::mirror::MarkSubject;
++constexpr u32 kMarkFramed = ::aurora::mirror::MarkFramed;
++constexpr u32 kMarkCut = ::aurora::mirror::MarkCut;
+ float g_viewScale = 1.f;            // this frame's (FIFO thread)
++float g_sill = 0.f;                 // 0111: this frame's sill (kMarkSill; 0: none), likewise
++float g_subject = 0.f;              // 0111: and the player's nearest depth (kMarkSubject; 0: none)
++bool g_framed = false;              // 0111: and whether an event's camera frames it (kMarkFramed)
++bool g_cameraCut = false;           // 0111: and whether the camera cut (kMarkCut)
+ long g_frameDraws = 0;              // this frame's draws so far (AURORA_MIRROR_SKIP)
+ bool g_haveProjection = false;
+ float g_p0 = 1, g_p2 = 1;
+@@ -2664,10 +2672,13 @@ void build_triangles(DrawJob& job) {
+ constexpr float kDecalLift = 3.f;
+ // How far past the view's sides the draws are kept (times the view's half-width), for a viewer
+ // leaning to look past the window's edges, or farther from the window than the camera, who sees in
+-// front of the glass more widely than the camera did (finish's easing counts on it). 1.4 left the
++// front of the glass more widely than the camera did (finish's cut at the allowance counts on it). 1.4 left the
+ // ground beneath the camera out, and the window's foot showed sky.
+ constexpr float kClipMargin = 2.f;
+ 
++// 0111: the glass's distance follows its target with this time constant (finish), seconds.
++constexpr float kPlaneSeconds = 1.f;
++
+ // Farther than this from the camera, a vertex is a runaway (a particle flung to 1e20): its
+ // triangles go, or the frame's bounds take everything with them (SHAR).
+ constexpr float kRunaway = 1e6f;
+@@ -3147,6 +3158,89 @@ struct Easing {
+   }
+ };
+ 
++// 0111: cuts every group's triangles at view depth `cut`, keeping what's beyond it, as a camera's
++// near plane cuts them (TPVR's). An edge crossing it gets one new vertex on it (shared by the two
++// triangles on the edge: no cracks), its attributes and mark (`marks`) taken along the edge.
++void cut_near(std::vector<MirrorVertex>& vertices, std::vector<Group>& groups, float cut,
++              std::vector<uint8_t>& marks) {
++  absl::flat_hash_map<uint64_t, uint32_t> crossings;
++  const auto depth = [&](uint32_t i) { return -vertices[i].position[2]; };
++  const auto crossing = [&](uint32_t i, uint32_t j) {
++    const uint64_t key = static_cast<uint64_t>(std::min(i, j)) << 32 | std::max(i, j);
++    if (auto found = crossings.find(key); found != crossings.end()) {
++      return found->second;
++    }
++    // From the lower index, so both triangles on the edge get the same vertex.
++    const uint32_t from = std::min(i, j), to = std::max(i, j);
++    const MirrorVertex a = vertices[from], b = vertices[to];
++    const float da = depth(from), db = depth(to);
++    const float t = std::clamp((cut - da) / (db - da), 0.f, 1.f);
++    MirrorVertex m{};
++    for (int c = 0; c < 3; ++c) {
++      m.position[c] = a.position[c] + (b.position[c] - a.position[c]) * t;
++    }
++    for (int c = 0; c < 2; ++c) {
++      m.uv[c] = a.uv[c] + (b.uv[c] - a.uv[c]) * t;
++    }
++    for (int c = 0; c < 4; ++c) {
++      const float ma = from_half(a.mul[c]), mb = from_half(b.mul[c]);
++      const float aa = from_half(a.add[c]), ab = from_half(b.add[c]);
++      m.mul[c] = half(ma + (mb - ma) * t);
++      m.add[c] = half(aa + (ab - aa) * t);
++    }
++    vertices.push_back(m);
++    marks.push_back(marks[from] & marks[to]);
++    const auto index = static_cast<uint32_t>(vertices.size() - 1);
++    crossings.emplace(key, index);
++    return index;
++  };
++  std::vector<uint32_t> out;
++  for (Group& group : groups) {
++    bool near = false;
++    for (uint32_t i : group.indices) {
++      if (depth(i) < cut) {
++        near = true;
++        break;
++      }
++    }
++    if (!near) {
++      continue;
++    }
++    out.clear();
++    for (size_t t = 0; t + 2 < group.indices.size(); t += 3) {
++      const uint32_t corners[3] = {group.indices[t], group.indices[t + 1], group.indices[t + 2]};
++      int inside = 0;
++      for (uint32_t i : corners) {
++        inside += depth(i) >= cut;
++      }
++      if (inside == 3) {
++        out.insert(out.end(), corners, corners + 3);
++        continue;
++      }
++      if (inside == 0) {
++        continue;
++      }
++      // The polygon beyond the cut, in the triangle's winding (a triangle or a quad).
++      uint32_t polygon[4];
++      int count = 0;
++      for (int c = 0; c < 3; ++c) {
++        const uint32_t i = corners[c], j = corners[(c + 1) % 3];
++        const bool in = depth(i) >= cut;
++        if (in) {
++          polygon[count++] = i;
++        }
++        if (in != (depth(j) >= cut)) {
++          polygon[count++] = crossing(i, j);
++        }
++      }
++      for (int c = 1; c + 1 < count; ++c) {
++        out.insert(out.end(), {polygon[0], polygon[c], polygon[c + 1]});
++      }
++    }
++    group.indices.swap(out);
++  }
++}
++
+ // Splits every group's triangles that reach in front of `plane` wherever an edge's far end is more
+ // than 40% deeper than its near end, edge midpoints shared. A midpoint is marked (`marks`, one per
+ // vertex) when both its ends are. With an easing, a marked (decal) edge is also split while, eased,
+@@ -3285,6 +3379,10 @@ struct Job {
+   bool scene = false;
+   uint32_t tag = 0;
+   float focus = 0, tanHalfX = 1, tanHalfY = 1;
++  float sill = 0;    // 0111: where the window's foot meets the player's ground (kMarkSill; 0: none)
++  float subject = 0; // 0111: the player's nearest view depth, to keep whole (kMarkSubject; 0: none)
++  bool framed = false; // 0111: an event's camera, framing its own subject (kMarkFramed)
++  bool cut = false;    // 0111: the camera cut since the frame before (kMarkCut)
+   std::vector<OwnedTexture> textures;
+   std::vector<uint64_t> removed;
+ };
+@@ -3305,6 +3403,11 @@ std::atomic<float> g_lastPlane{0}, g_lastFocus{0}, g_lastBandShare{0};
+ // 1 / (2 tan)) (set_front_allowance).
+ std::atomic<float> g_frontAllowance{0}, g_cameraWidths{0};
+ std::atomic<float> g_lastAllowance{0}; // the last frame's, the lesser limit (finish)
++std::atomic<float> g_lastCut{0};       // 0111: the last frame's near cut, as a share of the glass's distance
++std::atomic<float> g_lastSill{0};      // and the sill, likewise (0: none)
++std::atomic<float> g_lastSubject{0};   // and the player's nearest depth, likewise (0: none)
++std::atomic<bool> g_lastKeptPlayer{false}; // and whether the near field was eased to keep him whole
++std::atomic<float> g_lastPlaneTarget{0}; // and the glass's distance it eases toward (game units)
+ 
+ // 0110: the alpha layers (see AlphaOp), worked into what they lie on. A layer's quad blends a colour
+ // over the picture by the alpha left at each point: GX: out = C * fs(a) + dst * fd(a), in the
+@@ -3873,13 +3976,90 @@ void finish(Job& job) {
+   out.scene = job.scene && !job.groups.empty();
+   out.focus = job.focus;
+   out.plane = std::clamp(job.focus * 0.85f, 50.f, 20000.f);
++  // 0111: the glass at the ground's sill (kMarkSill: where the line of sight through the middle of
++  // the window's foot, in the window's re-aimed view, meets the ground at the player's feet), when
++  // that's nearer: the ground at the window's foot lies on the glass, as through a real window, and
++  // never comes out in front of it, where it was eased (it bent) or would be cut (a viewer farther
++  // away than the camera's place looked under its cut edge, at sky: TPVR's finding). Not nearer
++  // than a fifth of the focus (TPVR's half: Wind Waker's sailing camera, far and low, has the sea
++  // meet the window's foot at a quarter of the focus, and with the glass at half of it the sea
++  // there was cut, which left a band of the backdrop along the window's foot; nearer than a fifth,
++  // a far camera looking along the ground, a long sail or a wide cutscene shot, would have the
++  // world swell). Below that floor the ground at the window's foot comes in front of the glass
++  // again. Test runs: AURORA_MIRROR_GLASS=focus keeps the glass at the focus alone;
++  // AURORA_MIRROR_GLASS_FLOOR=<share of the focus> (0.5: TPVR's; a value that isn't a number keeps
++  // the fifth).
++  static const bool s_sill = [] {
++    const char* value = std::getenv("AURORA_MIRROR_GLASS");
++    return value == nullptr || std::strcmp(value, "focus") != 0;
++  }();
++  static const float s_glassFloor = [] {
++    const char* value = std::getenv("AURORA_MIRROR_GLASS_FLOOR");
++    char* end = nullptr;
++    const float share = value != nullptr ? std::strtof(value, &end) : 0.2f;
++    return value != nullptr && end != value && std::isfinite(share) ? std::clamp(share, 0.05f, 0.85f) : 0.2f;
++  }();
++  if (s_sill && job.sill > 0.f) {
++    out.plane = std::clamp(std::min(out.plane, std::max(job.sill, s_glassFloor * job.focus)), 50.f, 20000.f);
++  }
++  const float planeTarget = out.plane;
+   out.tanHalfX = job.tanHalfX;
+   out.tanHalfY = job.tanHalfY;
+   out.indices.clear();
+   out.parts.clear();
++  // 0111: the glass's eased distance and the focus and time it was eased at, the one finishing
++  // worker's. A frame without a scene (a load, a film's black) ends the easing: the next scene is a
++  // cut.
++  static float s_plane = 0.f, s_planeFocus = 0.f;
++  static std::chrono::steady_clock::time_point s_planeAt;
++  // And the share of it the glass comes nearer, to the player (below), and the focus it was at.
++  static float s_share = 1.f, s_shareFocus = 0.f;
++  float elapsed = 0.f; // since the finishing worker's last frame with a scene (seconds, at most 0.1)
++  static const float s_planeSeconds = [] {
++    const char* value = std::getenv("AURORA_MIRROR_PLANE_SECONDS");
++    char* end = nullptr;
++    const float seconds = value != nullptr ? std::strtof(value, &end) : kPlaneSeconds;
++    return value != nullptr && end != value && std::isfinite(seconds) ? std::max(seconds, 0.f) : kPlaneSeconds;
++  }();
+   if (!out.scene) {
+     out.vertices.clear();
++    s_plane = 0.f;
++    s_planeFocus = 0.f;
++    s_share = 1.f;
++    s_shareFocus = 0.f;
+   } else {
++    // 0111: the glass's distance, and with it the world's scale in the window (one window width
++    // spans the picture there), follows its target slowly (time constant kPlaneSeconds): the camera
++    // closing on Link and backing off moves the world rather than rescaling it, and the sill's
++    // steps don't jolt it. At once on a cut (the game's camera cut, MarkCut, or its focus jumped by
++    // 30% in a frame), after a frame without a scene, and after a gap (the window in 2D sends none);
++    // and never more than 30% beyond where it's going (a camera closing fast in small steps would
++    // leave the glass, and the cut with it, beyond its focus: TPVR's). Nearer than its target it
++    // only eases out (TPVR's jumped to within 30%: Link walking out of an event's shot took the
++    // sill away and the world shrank in a frame). Test runs: AURORA_MIRROR_PLANE_SECONDS=<s> (0: at
++    // once, as before).
++    {
++      const auto now = std::chrono::steady_clock::now();
++      const bool cut = job.cut || !(s_plane > 0.f) || !(s_planeFocus > 0.f) ||
++                       std::fabs(job.focus - s_planeFocus) > 0.3f * s_planeFocus ||
++                       now - s_planeAt > std::chrono::milliseconds(250);
++      elapsed = cut ? 0.f : std::clamp(std::chrono::duration<float>(now - s_planeAt).count(), 0.f, 0.1f);
++      if (cut || s_planeSeconds <= 0.f) {
++        s_plane = out.plane;
++      } else {
++        const float before = s_plane;
++        s_plane += (out.plane - s_plane) * (1.f - std::exp(-elapsed / s_planeSeconds));
++        // Within 30% of where it's going, but nearer by at most a tenth a frame: the sill can
++        // appear with no cut (Link walking into a still, wide shot, or an event's camera rising
++        // through his feet's height), and its target then drops by up to four fifths at once,
++        // which the 30% alone made a jump of the world's scale in one frame. The tenth a frame
++        // never holds it past 0.85 of the focus, where the glass would be with no sill.
++        s_plane = std::min(s_plane, std::max(out.plane * 1.3f, std::min(before * 0.9f, 0.85f * job.focus)));
++      }
++      s_planeFocus = job.focus;
++      s_planeAt = now;
++      out.plane = s_plane;
++    }
+     // The background behind everything else.
+     if (!job.backgroundRanges.empty() && job.nearestBackground < INFINITY && job.farthest > 0) {
+       const float push = std::clamp(1.25f * job.farthest / std::max(job.nearestBackground, 1e-3f), 1.f, 100.f);
+@@ -3917,22 +4097,116 @@ void finish(Job& job) {
+     // allowance, set_front_allowance). So beyond half the lesser of the two, what's nearer eases
+     // into the rest along its own line of sight: the picture from the camera stays the same, and
+     // the ground keeps its shape to below Link's feet. Easing changes triangles' shapes, so the
+-    // ones reaching that near are subdivided first, as for the band.
++    // ones reaching that near are subdivided first, as for the band. (0111: no longer by default:
++    // what would come out past the lesser of the two is cut there instead, below, and the glass
++    // comes no farther than the ground at the window's foot, above.)
+     static const bool s_band = [] {
+       const char* band = std::getenv("AURORA_MIRROR_BAND");
+       return band != nullptr && std::strcmp(band, "1") == 0;
+     }();
++    // The camera's distance in front of the glass, and the allowance, in window widths: the same
++    // whatever the glass's distance.
++    const float cameraWidths = g_cameraWidths.load(std::memory_order_relaxed);
++    const float camera = cameraWidths > 0.f ? cameraWidths : 1.f / (2.f * out.tanHalfX);
++    const float window = g_frontAllowance.load(std::memory_order_relaxed);
++    const float allowance = std::min(window, 0.9f * camera * (1.f - 1.f / kClipMargin));
++    // 0111: what's nearer than the glass is cut (below) unless a test run asks otherwise:
++    // AURORA_MIRROR_NEAR=ease eases it, as before, =raw leaves it.
++    enum class Near { Cut, Ease, Raw };
++    static const Near s_near = [] {
++      const char* value = std::getenv("AURORA_MIRROR_NEAR");
++      if (value != nullptr && std::strcmp(value, "ease") == 0) {
++        return Near::Ease;
++      }
++      if (value != nullptr && std::strcmp(value, "raw") == 0) {
++        return Near::Raw;
++      }
++      return Near::Cut;
++    }();
++    // 0111: what the window keeps whole nearest the camera: the player (the game's mark), and in an
++    // event's camera what lies nearest in the middle of the picture (its middle half each way; the
++    // solid draws, not the sky): a close-up's focus can lie far behind the face it frames, and the
++    // cut below took Aryll away whole on Outset's lookout. A depth a few hundred of those points
++    // deep, not the very nearest, so a stray leaf or spark doesn't count.
++    float subject = job.subject;
++    if (job.framed) {
++      static std::vector<float> s_depths;
++      s_depths.clear();
++      for (const Group& group : job.groups) {
++        if (group.blended || (group.part.flags & aurora::mirror::PartBackground) != 0) {
++          continue;
++        }
++        for (uint32_t i : group.indices) {
++          const float* q = out.vertices[i].position;
++          const float depth = -q[2];
++          if (depth > 0.01f * job.focus && std::fabs(q[0]) <= 0.5f * out.tanHalfX * depth &&
++              std::fabs(q[1]) <= 0.5f * out.tanHalfY * depth) {
++            s_depths.push_back(depth);
++          }
++        }
++      }
++      if (s_depths.size() >= 64) {
++        const size_t k = std::max<size_t>(32, s_depths.size() / 200);
++        std::nth_element(s_depths.begin(), s_depths.begin() + k, s_depths.end());
++        const float framed = s_depths[k];
++        subject = subject > 0.f ? std::min(subject, framed) : framed;
++      }
++    }
++    // 0111: the glass comes nearer, to the player (or what an event's camera frames), when he's
++    // nearer the camera than the cut below would keep him whole (no nearer than a tenth of the
++    // glass's distance beyond it): a camera pushed in close behind him, a lock-on with its focus
++    // far beyond him, a close-up (TPVR's, for the player). The picture from the camera is the
++    // same; he keeps his shape, and what's beyond goes deeper. Fully from a quarter of the glass's
++    // distance, and eased in from 0.15 of it, and nearer by at most a tenth a frame unless the
++    // camera cut (its focus jumped, or the game's camera cut: MarkCut), so the window's depths don't
++    // jump as he crosses those. Back out it goes slowly (kPlaneSeconds), so the world doesn't swell
++    // and shrink with every step or gesture of what it keeps (TPVR's went back as fast). What an
++    // event's camera frames is kept down to a twentieth of the glass's distance (the player's floor
++    // is for him gliding into first person; nearer than it, he's eased, then cut).
++    const float keepFrom = job.framed ? 0.05f : 0.15f, keepSpan = job.framed ? 0.05f : 0.1f;
++    {
++      float share = 1.f;
++      if (s_near == Near::Cut && subject > keepFrom * out.plane && window > 0.f && !s_band) {
++        const float floor = 1.f - allowance / camera + 0.1f;
++        const float whole = std::min(1.f, 0.95f * subject / (floor * out.plane));
++        const float ease = std::clamp((subject - keepFrom * out.plane) / (keepSpan * out.plane), 0.f, 1.f);
++        share = 1.f + (whole - 1.f) * ease;
++      }
++      if (!job.cut && s_shareFocus > 0.f && std::fabs(job.focus - s_shareFocus) < 0.3f * s_shareFocus) {
++        share = share < s_share ? std::max(share, s_share * 0.9f)
++                : s_planeSeconds > 0.f
++                    ? std::min(s_share + (share - s_share) * (1.f - std::exp(-elapsed / s_planeSeconds)), s_share / 0.9f)
++                    : std::min(share, s_share / 0.9f);
++      }
++      s_share = std::min(share, 1.f);
++      s_shareFocus = job.focus;
++      out.plane = std::clamp(out.plane * s_share, 50.f, 20000.f);
++    }
+     const float onPlane = out.plane * 1.0005f, band = 0.03f, bandEnd = onPlane * (1.f + band);
+     // In window widths in front of the glass, at depth d: k (plane - d) (MirrorScene.place); the
+     // camera is k plane in front of it.
+-    const float cameraWidths = g_cameraWidths.load(std::memory_order_relaxed);
+-    const float k = cameraWidths > 0.f ? cameraWidths / out.plane : 1.f / (2.f * out.plane * out.tanHalfX);
+-    const float window = g_frontAllowance.load(std::memory_order_relaxed);
+-    const float allowance = std::min(window, 0.9f * k * out.plane * (1.f - 1.f / kClipMargin));
++    const float k = camera / out.plane;
+     // C1 at the knee (it starts at slope 1), then nearing the allowance without reaching it.
+     const float knee = allowance * 0.5f;
+     const Easing easing{out.plane, k, knee, allowance - knee, out.plane - knee / k};
+-    const bool ease = !s_band && window > 0.f && easing.end > 0.f;
++    // 0111: what's nearer than the glass keeps its shape, and what would come out past the
++    // allowance is cut off there, as a camera's near plane cuts (TPVR's, which Trevor approved on
++    // the headset). Eased into the allowance instead, everything nearer than the glass was
++    // compressed along its line of sight, whether it would have fitted or not, and the ground at
++    // the window's foot creased where the easing began, the crease following the camera every
++    // frame. The ground there lies on the glass now (the sill, above). The cut never takes the
++    // player, or what an event's camera frames: the glass comes to it first (above); while it's
++    // still on its way (a lock-on, the camera closing in, a close-up), it within a tenth of the
++    // cut's depth beyond it or nearer, what's nearer than the glass is eased into the allowance for
++    // those frames, as before, or visionOS's own clip would cut it. Test runs: AURORA_MIRROR_NEAR=
++    // ease eases always and keeps the glass off the player, as before; =raw leaves it all
++    // (visionOS's own clip cuts it, about 0.47 m out).
++    const float cutAt = out.plane - allowance / k;
++    const bool keepPlayer = s_near == Near::Cut && subject > 0.f && subject < 1.1f * cutAt &&
++                            (job.framed || subject >= 0.12f * out.plane);
++    const bool ease = (s_near == Near::Ease || keepPlayer) && !s_band && window > 0.f && easing.end > 0.f;
++    const bool cutting =
++        s_near == Near::Cut && !keepPlayer && !s_band && window > 0.f && allowance > 0.f && cutAt > 1e-3f;
+     // 0110: the alpha layers, worked into the ground they lie on (cut where a light meets it).
+     build_alpha_layers(job);
+     std::vector<uint8_t> decal(out.vertices.size(), 0);
+@@ -3944,6 +4218,8 @@ void finish(Job& job) {
+       subdivide_near(out.vertices, job.groups, bandEnd, decal);
+     } else if (ease) {
+       subdivide_near(out.vertices, job.groups, easing.end, decal, &easing);
++    } else if (cutting) {
++      cut_near(out.vertices, job.groups, cutAt, decal);
+     }
+     for (size_t v = 0; v < out.vertices.size(); ++v) {
+       float* p = out.vertices[v].position;
+@@ -3970,8 +4246,20 @@ void finish(Job& job) {
+       }
+     }
+     g_lastPlane = out.plane;
++    g_lastPlaneTarget = planeTarget;
+     g_lastFocus = out.focus;
+-    g_lastAllowance = ease ? allowance : 0.f;
++    g_lastAllowance = ease || cutting ? allowance : 0.f;
++    g_lastCut = cutting ? cutAt / out.plane : 0.f;
++    g_lastSill = job.sill / out.plane;
++    g_lastSubject = subject / out.plane;
++    g_lastKeptPlayer = keepPlayer && ease;
++    // Test runs: AURORA_MIRROR_PLANE_LOG=<any value> logs each frame's glass (the dolly's evidence).
++    static const bool s_planeLog = std::getenv("AURORA_MIRROR_PLANE_LOG") != nullptr;
++    if (s_planeLog) {
++      Log.info("mirror plane: frame {} focus {:.1f} sill {:.1f} target {:.1f} glass {:.1f} cut {:.1f} kept {:.1f}{}{}",
++               job.tag, job.focus, job.sill, planeTarget, out.plane, cutting ? cutAt : 0.f, subject,
++               job.framed ? " (an event's camera)" : "", keepPlayer && ease ? " (eased, to keep it)" : "");
++    }
+     g_lastBandShare = out.vertices.empty() ? 0.f : static_cast<float>(moved) / static_cast<float>(out.vertices.size());
+     float low[3] = {INFINITY, INFINITY, INFINITY}, high[3] = {-INFINITY, -INFINITY, -INFINITY};
+     for (const MirrorVertex& vertex : out.vertices) {
+@@ -4097,6 +4385,10 @@ void publish(bool scene, float focus) {
+       g_job.scene = scene;
+       g_job.tag = g_frameTag;
+       g_job.focus = focus;
++      g_job.sill = g_sill;
++      g_job.subject = g_subject;
++      g_job.framed = g_framed;
++      g_job.cut = g_cameraCut;
+       g_job.tanHalfX = g_haveProjection ? 1.f / g_p0 / g_viewScale : 1.f;
+       g_job.tanHalfY = g_haveProjection ? 1.f / g_p2 / g_viewScale : 1.f;
+       g_jobPending = true;
+@@ -4138,9 +4430,13 @@ void publish(bool scene, float focus) {
+                static_cast<double>(g_alphaLayerTriangles.exchange(0)) / static_cast<double>(finished));
+     }
+     log_tally(f);
+-    Log.info("mirror: glass at {:.0f} (focus {:.0f}), {:.1f}% of vertices moved nearer it (into its band, or "
+-             "easing into {:.2f} window widths in front; clipped ones counted too)",
+-             g_lastPlane.load(), g_lastFocus.load(), g_lastBandShare.load() * 100.f, g_lastAllowance.load());
++    Log.info("mirror: glass at {:.0f} (easing to {:.0f}; focus {:.0f}, sill {:.2f} of the glass's distance, the "
++             "player, or what an event's camera frames, from {:.2f} of it), {:.1f}% of vertices moved nearer it "
++             "(into its band, or easing into {:.2f} window widths in front{}; clipped ones counted too); near cut "
++             "at {:.2f} of the glass's distance",
++             g_lastPlane.load(), g_lastPlaneTarget.load(), g_lastFocus.load(), g_lastSill.load(),
++             g_lastSubject.load(), g_lastBandShare.load() * 100.f, g_lastAllowance.load(),
++             g_lastKeptPlayer.load() ? ", to keep it whole" : "", g_lastCut.load());
+     g_stats = {};
+   }
+ }
+@@ -4153,8 +4449,28 @@ void mark(u32 mark, f32 value) noexcept {
+     g_viewScale = std::isfinite(value) ? std::clamp(value, 1.f, 4.f) : 1.f;
+     return;
+   }
++  if (mark == kMarkSill) {
++    g_sill = std::isfinite(value) && value > 0.f ? value : 0.f;
++    return;
++  }
++  if (mark == kMarkSubject) {
++    g_subject = std::isfinite(value) && value > 0.f ? value : 0.f;
++    return;
++  }
++  if (mark == kMarkFramed) {
++    g_framed = value > 0.5f;
++    return;
++  }
++  if (mark == kMarkCut) {
++    g_cameraCut = value > 0.5f;
++    return;
++  }
+   if (mark == AURORA_MIRROR_MARK_BEGIN) {
+     g_viewScale = 1.f;
++    g_sill = 0.f;
++    g_subject = 0.f;
++    g_framed = false;
++    g_cameraCut = false;
+     g_frameDraws = 0;
+     discard_jobs(); // a frame that never ended
+     g_frameTag = static_cast<uint32_t>(std::max(value, 0.f)) & 0xFFFFFFu;

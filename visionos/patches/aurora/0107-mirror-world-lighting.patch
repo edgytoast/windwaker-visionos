@@ -1,0 +1,428 @@
+diff --git a/lib/gx/mirror.cpp b/lib/gx/mirror.cpp
+index 5989966..b7f0b93 100644
+--- a/lib/gx/mirror.cpp
++++ b/lib/gx/mirror.cpp
+@@ -457,6 +457,11 @@ struct Capture {
+   uint64_t id;
+   gfx::TextureHandle handle;
+   uint8_t swizzle; // the channels as the TEV reads them (a swap table's red as alpha, for a shadow)
++  // 0107: a mask: its alpha read as 1 above `threshold` and 0 at or below it (where the draw passes
++  // its alpha test: Wind Waker's real-time shadows). The threshold changes as a shadow fades; the
++  // copy keeps one id (one texture in the window) all the same.
++  bool mask = false;
++  uint8_t threshold = 0;
+ };
+ struct CaptureVariant {
+   uint64_t id = 0;
+@@ -468,7 +473,7 @@ struct CopySlot {
+   uint32_t revision = 0;
+   size_t occurrence = 0;
+   std::deque<TexEntry> entries; // per occurrence (the TEV's view of it); a deque, so they stay put
+-  std::deque<std::unordered_map<uint8_t, CaptureVariant>> variants; // per occurrence, by swizzle
++  std::deque<std::unordered_map<uint16_t, CaptureVariant>> variants; // per occurrence, by swizzle | mask << 8
+ };
+ std::unordered_map<const void*, CopySlot> g_copySlots; // FIFO thread
+ constexpr size_t kCaptureRing = 256;
+@@ -1172,6 +1177,8 @@ fn fs(in: VertexOut) -> @location(0) vec4f {
+ struct Readback {
+   uint64_t id = 0;
+   uint8_t swizzle = kIdentitySwizzle;
++  bool mask = false;
++  uint8_t threshold = 0;
+   wgpu::Texture target;
+   wgpu::Buffer buffer;
+   std::atomic<bool> busy{false};
+@@ -1317,6 +1324,8 @@ void capture_task(const gfx::EncoderTaskContext& ctx, const wgpu::CommandEncoder
+   const wgpu::Extent3D size{kCaptureSize, kCaptureSize, 1};
+   encoder.CopyTextureToBuffer(&source, &destination, &size);
+   readback->swizzle = capture.swizzle;
++  readback->mask = capture.mask;
++  readback->threshold = capture.threshold;
+   readback->busy = true;
+   g_captureEncoded[slot] = readback;
+ }
+@@ -1340,6 +1349,12 @@ void capture_submitted(const gfx::EncoderTaskCompletionContext&, const void* pay
+                 }
+               }
+             }
++            if (readback->mask) {
++              const uint8_t threshold = readback->threshold;
++              for (size_t i = 3; i < rgba.size(); i += 4) {
++                rgba[i] = rgba[i] > threshold ? 255 : 0;
++              }
++            }
+             // Test runs: AURORA_MIRROR_CAPTURE_LOG=1 logs each read-back mask's alpha (a shadow's
+             // darkness): a mask almost all opaque draws as a dark square under its actor.
+             static const bool s_captureLog = [] {
+@@ -1414,6 +1429,9 @@ const bool kLookups = switch_on("AURORA_MIRROR_LOOKUPS");
+ // 0105 test switch: AURORA_MIRROR_OVER_HAIR=0 reads the eyes' blend as before (additive), with no
+ // bake.
+ const bool kOverHair = switch_on("AURORA_MIRROR_OVER_HAIR");
++// 0107 test switch: AURORA_MIRROR_REAL_SHADOWS=0 reads a real-time shadow's blend as before
++// (additive: no shadow).
++const bool kRealShadows = switch_on("AURORA_MIRROR_REAL_SHADOWS");
+ 
+ bool colour_coord(const ShaderConfig& config, int coord) {
+   if (coord < 0 || coord >= static_cast<int>(MaxTexCoord)) {
+@@ -1829,6 +1847,14 @@ float fog_at(const DrawState& st, F3 view) {
+   return std::clamp(z, 0.f, 1.f);
+ }
+ 
++// 0107 test switch: AURORA_MIRROR_FOG_SPLIT=0 fogs at the vertices only, as before.
++const bool kFogSplit = switch_on("AURORA_MIRROR_FOG_SPLIT");
++// The most a fog factor may change along a triangle's edge before the edge is split, and how many
++// times a triangle may be split (each halving its edges): a triangle from under the camera to the
++// horizon becomes at most a few hundred.
++constexpr float kFogStep = 1.f / 8.f;
++constexpr int kFogSplits = 5;
++
+ // --- Draws, decoded on worker threads. The FIFO thread snapshots what a draw's vertices read and
+ // moves on; the frame's END waits for them all and merges them in the game's order. The game's
+ // vertex arrays stay put until then: the game thread waits for the FIFO before its next frame.
+@@ -1857,6 +1883,16 @@ struct DrawJob {
+   // a bake of the TEV's whole result (its colour and alpha as they are).
+   float pull = 0.f;
+   bool baked = false;
++  // 0107: each vertex's colour before its fog, and its fog: a draw whose fog changes much across
++  // a triangle has that triangle split (build_triangles), each new vertex fogged where it is.
++  // GX fogs each pixel by its depth; fogged at the vertices only, a big polygon (the sea's plane,
++  // from under the camera to the horizon) took the horizon's haze far into the near sea.
++  struct Prefog {
++    float mul[4], add[4];
++    float transmitted, fog;
++  };
++  bool fogged = false;
++  std::vector<Prefog> prefog;
+   // 0106: draws the command processor merged into this one (no GX state changed between them): each
+   // primitive's first vertex and count in `bytes`. Empty: one primitive, `prim`, of every vertex.
+   struct Segment {
+@@ -2035,6 +2071,24 @@ std::array<Sym, 4> run_tev(const DrawJob& job, const F4 raster[2], const F4* loo
+   return result;
+ }
+ 
++// A vertex's colour from its colour before fog and its fog (GX's: towards the fog's colour).
++void apply_fog(const DrawJob& job, const DrawJob::Prefog& pre, MirrorVertex& out) {
++  const float fog = pre.fog;
++  for (int c = 0; c < 4; ++c) {
++    float mul = pre.mul[c], addend = pre.add[c];
++    if (c < 3 && fog > 0.f) {
++      mul *= 1.f - fog;
++      addend = addend * (1.f - fog) + fog * job.state.fog.color[c];
++    }
++    if (c == 3 && job.behind && !job.baked) {
++      mul = 0.f;
++      addend = 1.f - std::clamp(pre.transmitted, 0.f, 1.f) * (1.f - fog);
++    }
++    out.mul[c] = half(mul);
++    out.add[c] = half(addend);
++  }
++}
++
+ // Vertex v into job.vertices[v]; its distance from the camera back.
+ float decode_vertex(DrawJob& job, const Decoder& decoder, uint32_t v) {
+   const auto& st = job.state;
+@@ -2094,12 +2148,17 @@ float decode_vertex(DrawJob& job, const Decoder& decoder, uint32_t v) {
+     out.uv[0] = std::isfinite(uv[0]) ? uv[0] : 0.f;
+     out.uv[1] = std::isfinite(uv[1]) ? uv[1] : 0.f;
+   }
++  DrawJob::Prefog pre{};
++  pre.fog = fog;
+   if (job.baked) {
+     // 0105: the baked texture is the TEV's whole result; only the fog is per vertex.
+     for (int c = 0; c < 4; ++c) {
+-      const bool fogged = c < 3 && fog > 0.f;
+-      out.mul[c] = half(fogged ? 1.f - fog : 1.f);
+-      out.add[c] = half(fogged ? fog * st.fog.color[c] : 0.f);
++      pre.mul[c] = 1.f;
++      pre.add[c] = 0.f;
++    }
++    apply_fog(job, pre, out);
++    if (job.fogged) {
++      job.prefog[v] = pre;
+     }
+     return std::sqrt(dot(view, view));
+   }
+@@ -2125,17 +2184,13 @@ float decode_vertex(DrawJob& job, const Decoder& decoder, uint32_t v) {
+         s.c += s.kb * kBehindAverage;
+       }
+     }
+-    float mul = s.sel >= 0 ? s.k : 0.f, addend = s.c;
+-    if (c < 3 && fog > 0.f) {
+-      mul *= 1.f - fog;
+-      addend = addend * (1.f - fog) + fog * st.fog.color[c];
+-    }
+-    if (c == 3 && job.behind) {
+-      mul = 0.f;
+-      addend = 1.f - std::clamp(transmitted, 0.f, 1.f) * (1.f - fog);
+-    }
+-    out.mul[c] = half(mul);
+-    out.add[c] = half(addend);
++    pre.mul[c] = s.sel >= 0 ? s.k : 0.f;
++    pre.add[c] = s.c;
++  }
++  pre.transmitted = transmitted;
++  apply_fog(job, pre, out);
++  if (job.fogged) {
++    job.prefog[v] = pre;
+   }
+   return std::sqrt(dot(view, view));
+ }
+@@ -2181,10 +2236,7 @@ void build_triangles(DrawJob& job) {
+     built.push_back(out);
+     return static_cast<uint32_t>(built.size() - 1);
+   };
+-  const auto triangle = [&](uint32_t a, uint32_t b, uint32_t c) {
+-    if (a == b || b == c || a == c || a >= vtxCount || b >= vtxCount || c >= vtxCount) {
+-      return;
+-    }
++  const auto clipped = [&](uint32_t a, uint32_t b, uint32_t c) {
+     uint32_t polygon[9] = {a, b, c};
+     int count = 3;
+     // The sky only at the near plane: it goes on past the view's sides, for a viewer leaning in.
+@@ -2220,6 +2272,92 @@ void build_triangles(DrawJob& job) {
+       job.triangles.insert(job.triangles.end(), {polygon[0], polygon[i + 1], polygon[i]});
+     }
+   };
++  // 0107: a fogged draw's triangles split where their fog changes by more than kFogStep along an
++  // edge (shared midpoints, so no cracks; children keep their parent's winding), each new vertex
++  // fogged at its own depth.
++  static thread_local absl::flat_hash_map<uint64_t, uint32_t> midpoints;
++  midpoints.clear();
++  const auto midpoint = [&](uint32_t i, uint32_t j) {
++    const uint64_t key = static_cast<uint64_t>(std::min(i, j)) << 32 | std::max(i, j);
++    if (auto found = midpoints.find(key); found != midpoints.end()) {
++      return found->second;
++    }
++    const MirrorVertex a = built[i], b = built[j];
++    const DrawJob::Prefog pa = job.prefog[i], pb = job.prefog[j];
++    MirrorVertex m{};
++    DrawJob::Prefog pm{};
++    for (int c = 0; c < 3; ++c) {
++      m.position[c] = (a.position[c] + b.position[c]) * 0.5f;
++    }
++    for (int c = 0; c < 2; ++c) {
++      m.uv[c] = (a.uv[c] + b.uv[c]) * 0.5f;
++    }
++    for (int c = 0; c < 4; ++c) {
++      pm.mul[c] = (pa.mul[c] + pb.mul[c]) * 0.5f;
++      pm.add[c] = (pa.add[c] + pb.add[c]) * 0.5f;
++    }
++    pm.transmitted = (pa.transmitted + pb.transmitted) * 0.5f;
++    pm.fog = fog_at(job.state, F3{m.position[0], m.position[1], m.position[2]});
++    apply_fog(job, pm, m);
++    built.push_back(m);
++    const auto index = static_cast<uint32_t>(built.size() - 1);
++    // Clipping's new vertices have no fog of their own kept (nothing splits them): skipped here.
++    job.prefog.resize(built.size());
++    job.prefog[index] = pm;
++    midpoints.emplace(key, index);
++    return index;
++  };
++  const auto splits = [&](uint32_t i, uint32_t j) { return std::fabs(job.prefog[i].fog - job.prefog[j].fog) > kFogStep; };
++  const auto fogSplit = [&](auto& self, uint32_t v0, uint32_t v1, uint32_t v2, int level) -> void {
++    const bool s01 = level < kFogSplits && splits(v0, v1), s12 = level < kFogSplits && splits(v1, v2),
++               s20 = level < kFogSplits && splits(v2, v0);
++    const int count = s01 + s12 + s20;
++    if (count == 0) {
++      clipped(v0, v1, v2);
++      return;
++    }
++    if (count == 3) {
++      const uint32_t m01 = midpoint(v0, v1), m12 = midpoint(v1, v2), m20 = midpoint(v2, v0);
++      self(self, v0, m01, m20, level + 1);
++      self(self, m01, v1, m12, level + 1);
++      self(self, m20, m12, v2, level + 1);
++      self(self, m01, m12, m20, level + 1);
++      return;
++    }
++    // Rotated so the split edges come first: (v0 v1), then (v1 v2).
++    if (count == 1) {
++      if (s12) {
++        return self(self, v1, v2, v0, level);
++      }
++      if (s20) {
++        return self(self, v2, v0, v1, level);
++      }
++      const uint32_t m01 = midpoint(v0, v1);
++      self(self, v0, m01, v2, level + 1);
++      self(self, m01, v1, v2, level + 1);
++      return;
++    }
++    if (!s01) {
++      return self(self, v1, v2, v0, level);
++    }
++    if (!s12) {
++      return self(self, v2, v0, v1, level);
++    }
++    const uint32_t m01 = midpoint(v0, v1), m12 = midpoint(v1, v2);
++    self(self, m01, v1, m12, level + 1);
++    self(self, v0, m01, m12, level + 1);
++    self(self, v0, m12, v2, level + 1);
++  };
++  const auto triangle = [&](uint32_t a, uint32_t b, uint32_t c) {
++    if (a == b || b == c || a == c || a >= vtxCount || b >= vtxCount || c >= vtxCount) {
++      return;
++    }
++    if (job.fogged) {
++      fogSplit(fogSplit, a, b, c, 0);
++    } else {
++      clipped(a, b, c);
++    }
++  };
+   const auto& indices = job.indices;
+   if (!indices.empty()) {
+     for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+@@ -2234,10 +2372,16 @@ void build_triangles(DrawJob& job) {
+         triangle(o + i, o + i + 1, o + i + 2);
+       }
+     } else if (prim == GX_QUADS) {
+-      for (uint32_t i = 0; i + 3 < n; i += 4) {
++      uint32_t i = 0;
++      for (; i + 3 < n; i += 4) {
+         triangle(o + i, o + i + 1, o + i + 2);
+         triangle(o + i + 2, o + i + 3, o + i);
+       }
++      // 0107: three left over are a triangle, as the hardware (and aurora's own draw) has it:
++      // Wind Waker draws its stars and the sun's rays as quads of three vertices.
++      if (n - i == 3) {
++        triangle(o + i, o + i + 1, o + i + 2);
++      }
+     } else if (prim == GX_TRIANGLESTRIP) {
+       for (uint32_t i = 2; i < n; ++i) {
+         if (i == 2 || (i & 1) == 0) {
+@@ -2284,6 +2428,8 @@ void process(DrawJob& job) {
+   const Decoder decoder{job.state, job.config, job.bytes.data(), job.bytes.size()};
+   job.vertices.resize(job.vtxCount);
+   job.triangles.clear();
++  job.fogged = kFogSplit && job.state.fog.type != GX_FOG_NONE;
++  job.prefog.resize(job.fogged ? job.vtxCount : 0);
+   job.nearest = INFINITY;
+   job.farthest = 0;
+   for (uint32_t v = 0; v < job.vtxCount; ++v) {
+@@ -3121,6 +3267,22 @@ void debug_group(const std::string* label) noexcept {
+   }
+ }
+ 
++// 0107: the texel alpha (0-255) above which a draw whose alpha is k * T.a + c passes its alpha
++// test, for a test of "greater" (or "greater or equal") than a reference: 255 when no texel does
++// (a shadow faded out); -1 when the test isn't such a threshold, or every texel passes.
++int shadow_threshold(const AlphaCompare& compare, const Sym& alpha) {
++  if (alpha.sel < 0 || alpha.k <= 1e-4f || (compare.comp0 != GX_GREATER && compare.comp0 != GX_GEQUAL)) {
++    return -1;
++  }
++  const float texel = (static_cast<float>(compare.ref0) / 255.f - alpha.c) / alpha.k * 255.f;
++  // Passed: alpha > texel ("greater"), alpha >= texel ("greater or equal"), as alpha > the result.
++  const float above = compare.comp0 == GX_GREATER ? std::floor(texel) : std::ceil(texel) - 1.f;
++  if (!(above >= 0.f)) {
++    return -1; // every texel passes: no mask
++  }
++  return static_cast<int>(std::min(above, 255.f));
++}
++
+ // 0105: how much nearer the camera an eye drawn over the hair is put (game units; Wind Waker's are
+ // about a centimetre): past the hair in front of the face, short of what stands in front of the
+ // character.
+@@ -3314,6 +3476,31 @@ bool bake_pair(DrawJob& job, MirrorPart& part) {
+ 
+ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8* vertices, const u16* indices,
+             u32 indexCount, bool merged) noexcept {
++  // 0107 test switch: AURORA_MIRROR_TRACE_FRAME=<n> logs every draw of mirror frame n (merged ones
++  // aside), recorded or not, with its state: what the scene is made of, and what the mirror skips.
++  static const long s_traceFrame = [] {
++    const char* value = std::getenv("AURORA_MIRROR_TRACE_FRAME");
++    return value != nullptr ? std::atol(value) : -1L;
++  }();
++  if (s_traceFrame >= 0 && static_cast<long>(g_frame) == s_traceFrame && !merged) {
++    const auto& st = g_gxState;
++    std::string maps;
++    for (u32 i = 0; i < config.tevStageCount; ++i) {
++      const auto& stage = config.tevStages[i];
++      if (stage.texMapId < MaxTextures) {
++        const auto& obj = st.loadedTextures[stage.texMapId];
++        maps += fmt::format(" map{} fmt{} {}x{}", static_cast<int>(stage.texMapId), obj.format(), obj.width(), obj.height());
++      }
++    }
++    const auto& ac = config.alphaCompare;
++    Log.info("mirror trace: recording {} offscreen {} prim {} vertices {} stages {} ind {} proj {} blend {} {}->{} "
++             "depth {}{} colour {} alpha {} test {} {} {} {} {}{}",
++             g_recording, g_offscreen, static_cast<int>(prim), vtxCount, config.tevStageCount, config.numIndStages,
++             static_cast<int>(st.projType), static_cast<int>(st.blendMode), static_cast<int>(st.blendFacSrc),
++             static_cast<int>(st.blendFacDst), st.depthCompare ? "test" : "-", st.depthUpdate ? "+write" : "",
++             st.colorUpdate, st.alphaUpdate, static_cast<int>(ac.comp0), ac.ref0, static_cast<int>(ac.op),
++             static_cast<int>(ac.comp1), ac.ref1, maps);
++  }
+   if (!g_recording || g_offscreen > 0 || vtxCount == 0) {
+     tally(g_offscreen > 0 ? TallyOffscreen : TallyOutside);
+     g_mergeTarget = nullptr;
+@@ -3322,7 +3509,11 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+   }
+   // 0106: a draw the command processor merged into the last (no GX state changed between them)
+   // joins the last's job, or is left out as it was: its state, material and plan are the same.
+-  if (merged && indices == nullptr) {
++  static const bool s_mergeJobs = [] {
++    const char* value = std::getenv("AURORA_MIRROR_MERGE");
++    return value == nullptr || std::strcmp(value, "0") != 0;
++  }();
++  if (merged && indices == nullptr && s_mergeJobs) {
+     if (g_mergeTarget != nullptr) {
+       DrawJob& job = *g_mergeTarget;
+       if (job.segments.empty()) {
+@@ -3395,9 +3586,18 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+   // blend, and the dark eyes vanished. The mask is the eye's own alpha where nothing nearer hides it:
+   // a plain alpha blend, tested against depth from kOverHairPull nearer (decode_vertex), so the hair
+   // in front of the face doesn't hide it and what stands in front of the character still does.
+-  const bool overHair = kOverHair && st.blendMode == GX_BM_BLEND && st.blendFacSrc == GX_BL_DSTALPHA &&
+-                        st.blendFacDst == GX_BL_INVDSTALPHA && !(st.depthCompare && st.depthFunc != GX_ALWAYS);
+-  if (overHair) {
++  //
++  // 0107: and Wind Waker's real-time shadows (a character's, cast on the ground: dDlst_shadowReal_c)
++  // blend the same way, with a depth test: the silhouette goes into the framebuffer's alpha first,
++  // then the ground beneath it is drawn again in black (its alpha the same silhouette, a copy
++  // projected from the light), blended by that alpha. As GX's factors, additive black: no shadow.
++  // As an alpha blend by its own alpha, the ground darkens where the silhouette falls.
++  const bool dstAlphaBlend = st.blendMode == GX_BM_BLEND && st.blendFacSrc == GX_BL_DSTALPHA &&
++                             st.blendFacDst == GX_BL_INVDSTALPHA;
++  const bool dstAlphaDepthTest = st.depthCompare && st.depthFunc != GX_ALWAYS;
++  const bool overHair = kOverHair && dstAlphaBlend && !dstAlphaDepthTest;
++  const bool realShadow = kRealShadows && dstAlphaBlend && dstAlphaDepthTest;
++  if (overHair || realShadow) {
+     part.kind = aurora::mirror::PartBlend;
+     part.colourBase = 0.f;
+     part.colourAlpha = 1.f;
+@@ -3527,6 +3727,13 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+   light(job, none, F3{}, F3{1, 0, 0}, raster);
+   const auto structure = run_tev(job, raster);
+   job.constantResult = structure;
++  if (realShadow && !job.perVertex) {
++    // 0107: the shadow's darkness is the register's alpha (A0, which its mask's silhouette selects).
++    // GX blends in the picture's gamma, RealityKit in linear light: black at opacity a darkens a
++    // GX picture to (1 - a) of it, which in linear light is about (1 - a)^2.2.
++    auto& alpha = job.constantResult[3];
++    alpha.k = 1.f - std::pow(1.f - std::clamp(alpha.k, 0.f, 1.f), 2.2f);
++  }
+   for (int c = 0; c < 4; ++c) {
+     job.channelSel[c] = plan.primary != nullptr ? structure[c].sel : -1;
+   }
+@@ -3548,7 +3755,11 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+     if (plan.primary->captured) {
+       // A read-back copy, swizzled as it arrives: read back right here, after this draw, before the
+       // game draws the next shadow into the same copy.
+-      CaptureVariant& variant = plan.captureSlot->variants[plan.captureOccurrence][swizzle];
++      // 0107: a real-time shadow's mask as its alpha test reads it: in the silhouette or not.
++      const int threshold = realShadow ? shadow_threshold(config.alphaCompare, structure[3]) : -1;
++      const bool mask = threshold >= 0;
++      CaptureVariant& variant =
++          plan.captureSlot->variants[plan.captureOccurrence][static_cast<uint16_t>(swizzle | (mask ? 1 : 0) << 8)];
+       if (variant.id == 0) {
+         variant.id = g_nextTextureId++;
+       }
+@@ -3579,7 +3790,8 @@ void record(GXPrimitive prim, const ShaderConfig& config, u16 vtxCount, const u8
+         const uint32_t slot = g_captureNext++ % kCaptureRing;
+         {
+           std::lock_guard lock(g_captureMutex);
+-          g_captureRing[slot] = {part.texture, plan.captureHandle, swizzle};
++          g_captureRing[slot] = {part.texture, plan.captureHandle, swizzle, mask,
++                                 static_cast<uint8_t>(mask ? threshold : 0)};
+         }
+         gfx::push_encoder_task_in_stream(g_captureTask, &slot, sizeof slot);
+       }

@@ -28,6 +28,9 @@
 #include "m_Do/m_Do_mtx.h"
 #include "m_Do/m_Do_printf.h"
 #include "JSystem/J2DGraph/J2DOrthoGraph.h"
+#if COS_VISIONOS
+#include "JSystem/J3DGraphBase/J3DShape.h"  // the VR fader (mDoGph_vrDrawFader)
+#endif
 #include "JSystem/J2DGraph/J2DPrint.h"
 #include "JSystem/JFramework/JFWDisplay.h"
 #include "JSystem/JFramework/JFWSystem.h"
@@ -42,6 +45,10 @@
 #include "JSystem/JUtility/JUTVideo.h"
 #include "JSystem/JUtility/JUTXfb.h"
 #include "dolphin/base/PPCArch.h"
+#if COS_VISIONOS
+#include "wwvr_window.h" // visionos/host: the Window view's hooks
+#include "wwvr_vr.h"     // visionos/host: the Full and Progressive spaces' hooks
+#endif
 
 JUTFader * mDoGph_gInf_c::mFader;
 ResTIMG * mDoGph_gInf_c::mFrameBufferTimg;
@@ -156,8 +163,20 @@ void* mDoGph_gInf_c::alloc(u32 size, int align) {
 }
 
 /* 80007EE4-80007F1C       .text free__13mDoGph_gInf_cFv */
+#if COS_VISIONOS
+// Counts the painter's display-heap swaps: what was allocated from it since the last stays valid
+// until the next but one (wwvr_vr.h, wwvr_paint_generation).
+static u32 sVrPaintGeneration = 0;
+extern "C" unsigned wwvr_paint_generation(void) {
+    return sVrPaintGeneration;
+}
+#endif
+
 void mDoGph_gInf_c::free() {
     mHeap[mCurrentHeap ^= 1]->freeAll();
+#if COS_VISIONOS
+    sVrPaintGeneration++;
+#endif
 }
 
 /* 80007F1C-80007F6C       .text fadeOut__13mDoGph_gInf_cFfR8_GXColor */
@@ -188,6 +207,11 @@ void mDoGph_gInf_c::fadeOut(f32 speed) {
 
 /* 80007FE8-800082D8       .text calcFade__13mDoGph_gInf_cFv */
 void mDoGph_gInf_c::calcFade() {
+#if COS_VISIONOS
+    // VR draws the camera block once per eye: the fade steps on the first (wwvr_vr.h).
+    if (!wwvr_vr_fade_steps()) {
+    } else
+#endif
     if (mFade) {
         mFadeRate += mFadeSpeed;
         if (mFadeRate < 0.0f) {
@@ -1579,17 +1603,111 @@ void setLight() {
     GXLoadLightObjImm(&lightObj, GX_LIGHT0);
 }
 
+#if COS_VISIONOS
+// VR repaints (visionos/host/wwvr_vr.h): the headset's display runs faster than the game's ticks,
+// so between ticks the painter draws the same draw lists again from the head's newest pose. A
+// repaint draws only: no tick wait, no display-heap swap, no picto-box steps, no wipe or fade
+// steps, no XFB copy.
+static bool sVrRepaint = false;
+
+void mDoGph_Repaint() {
+    sVrRepaint = true;
+    mDoGph_Painter();
+    sVrRepaint = false;
+}
+
+// The alpha JUTFader::control() is about to draw the scene fader at this frame (0: none), from its
+// step, without taking it (control() takes it in endRender). Also the VR room's fade opacity
+// (wwvr_vr.cpp).
+int mDoGph_faderAlphaThisFrame() {
+    JUTFader* fader = JFWDisplay::getManager()->getFader();
+    if (fader == NULL) {
+        return 0;
+    }
+    s32 status = fader->mStatus;
+    if (fader->mDelayTimer == 0) {
+        status = static_cast<s32>(fader->mDelayStatus);
+    }
+    const u32 timer = fader->mTimer + 1u;
+    u8 alpha;
+    switch (status) {
+    case JUTFader::WaitOut:
+        alpha = 0xFF;
+        break;
+    case JUTFader::FadeIn:
+        alpha = 0xFF - (fader->mFadeTime != 0 ? (timer * 0xFF) / fader->mFadeTime : 0);
+        break;
+    case JUTFader::FadeOut:
+        alpha = fader->mFadeTime != 0 ? (timer * 0xFF) / fader->mFadeTime : 0;
+        break;
+    default: // WaitIn: control() draws nothing
+        return 0;
+    }
+    return alpha;
+}
+
+// The scene fade (JFWDisplay's JUTFader, which endRender steps and draws over the EFB) drawn where
+// the frame goes out before endRender: in each VR eye (doors and loading zones fade the world in
+// the headset), and in the Window view with the 2D (the window takes its frame before endRender, so
+// it had no fades of these). Drawn as JUTFader::control() is about to: nothing while the fader
+// waits faded in (the game leaves its colour opaque then: drawn as it stood, the title screen was
+// black, and every stage change flashed black), else with this frame's step of its alpha (the
+// colour still holds last frame's, or a fade's opaque start colour).
+// The fader draws with J2D's 2D state, which JFWDisplay::endGX sets up first (an ortho port of the
+// screen): without it the box's vertices went out in the last 3D draw's vertex format.
+static void mDoGph_drawFaderAsIs() {
+    JUTFader* fader = JFWDisplay::getManager()->getFader();
+    const int alpha = mDoGph_faderAlphaThisFrame();
+    if (fader == NULL || alpha == 0) {
+        return;
+    }
+    u16 width, height;
+    JUTVideo::getManager()->getBounds(width, height);
+    J2DOrthoGraph ortho(0.0f, 0.0f, width, height, -1.0f, 1.0f);
+    ortho.setPort();
+    const u8 kept = fader->mColor.a;
+    fader->mColor.a = static_cast<u8>(alpha);
+    fader->draw();
+    fader->mColor.a = kept;
+    // The 3D's state again for the rest of the pass (J3D caches the vertex format it last set).
+    j3dSys.reinitGX();
+    J3DShape::resetVcdVatCache();
+}
+
+static void mDoGph_vrDrawFader() {
+    if (wwvr_vr_drawing()) {
+        mDoGph_drawFaderAsIs();
+    }
+}
+#endif
+
 /* 8000AF2C-8000BC38       .text mDoGph_Painter__Fv */
 bool mDoGph_Painter() {
+#if COS_VISIONOS
+    // Apple Vision Pro's Window view (visionos/host/wwvr_window.h): paced by the window, the
+    // frame numbered and the scene mirror's frame opened.
+    wwvr_window_begin_frame();
+#endif
 #if VERSION > VERSION_DEMO
     JFWDisplay::getManager()->setFader(mDoGph_gInf_c::mFader);
 #endif
     mDoGph_gInf_c::setClearColor(mDoGph_gInf_c::getBackColor());
+#if COS_VISIONOS
+    if (!sVrRepaint)
+#endif
     mDoGph_gInf_c::beginRender();
+#if COS_VISIONOS
+    // Apple Vision Pro's Full and Progressive spaces (visionos/host/wwvr_vr.h): the headset's frame,
+    // after the game's own wait for its tick in beginRender.
+    wwvr_vr_frame_begin();
+#endif
 
     GXSetAlphaUpdate(GX_FALSE);
 #if VERSION > VERSION_DEMO
     mDoGph_gInf_c::setBackColor(g_clearColor);
+#endif
+#if COS_VISIONOS
+    if (!sVrRepaint) // the lists being repainted use the display heap free() would swap in
 #endif
     mDoGph_gInf_c::free();
 
@@ -1627,6 +1745,12 @@ bool mDoGph_Painter() {
         if (camera != NULL) {
             PC_GPU_GROUP("shadow_image");
             dComIfGd_imageDrawShadow(camera->view.mViewMtx);
+#if COS_VISIONOS
+            // VR: the rest of the camera block once per eye, each into its own pass (wwvr_vr.h); in
+            // the window and flat, once. Behind a menu over the room, the world isn't drawn.
+            for (int vrEye = wwvr_vr_eye_first(); vrEye >= 0 && wwvr_vr_world_visible(); vrEye = wwvr_vr_eye_next(vrEye)) {
+            wwvr_vr_eye_begin(vrEye);
+#endif
 
             view_port_class viewport_crop;
             view_port_class* viewport_p = window->getViewPort();
@@ -1657,6 +1781,13 @@ bool mDoGph_Painter() {
             dComIfGp_setCurrentView(&camera->view);
             dComIfGp_setCurrentViewport(viewport_p);
             GXSetProjection(camera->view.mProjMtx, GX_PERSPECTIVE);
+#if COS_VISIONOS
+            wwvr_window_note_scene(camera->view.mProjMtx[0][0], camera->view.mProjMtx[1][1],
+                                   camera->view.mLookat.mEye.x, camera->view.mLookat.mEye.y,
+                                   camera->view.mLookat.mEye.z, camera->view.mLookat.mCenter.x,
+                                   camera->view.mLookat.mCenter.y, camera->view.mLookat.mCenter.z,
+                                   camera->view.mNear, camera->view.mFar);
+#endif
             PPCSync();
             j3dSys.setViewMtx(camera->view.mViewMtx);
             dKy_setLight();
@@ -1774,11 +1905,21 @@ bool mDoGph_Painter() {
             dComIfGd_drawOpaListMaskOff();
             dComIfGd_drawXluListMaskOff();
 
+#if COS_VISIONOS
+            // The 3D world is drawn; motion blur and depth of field are pictures of it.
+            wwvr_window_scene_drawn();
+#endif
             if (!dMenu_flag()) {
+#if COS_VISIONOS
+                // Motion blur and depth of field are pictures of one view: not in VR.
+                if (wwvr_vr_screen_effects())
+#endif
+                {
                 PC_GPU_GROUP("motion_blur");
                 motionBlure(&camera->view);
                 PC_GPU_GROUP("dof");
                 drawDepth(&camera->view, viewport_p, dComIfGp_getCameraZoomForcus(cameraID));
+                }
 #if VERSION == VERSION_PAL
                 GXInvalidateTexAll();
 #endif
@@ -1823,7 +1964,11 @@ bool mDoGph_Painter() {
 #endif
 
 #if VERSION > VERSION_DEMO
+#if COS_VISIONOS
+                if (mCaptureStep == 1 && !sVrRepaint) {
+#else
                 if (mCaptureStep == 1) {
+#endif
                     if (!mCaptureCansel)
                         mDoGph_screenCapture();
                     else
@@ -1831,13 +1976,24 @@ bool mDoGph_Painter() {
                 }
 #endif
             }
+#if COS_VISIONOS
+            mDoGph_vrDrawFader();
+            wwvr_vr_eye_end(vrEye);
+            }
+#endif
         }
     }
 
 #if TARGET_PC
     pc_dynres_3d_end(); // COS_DYNRES: the 3D stretched over the EFB, full scale again
 #endif
+#if COS_VISIONOS
+    wwvr_window_before_hud(); // the scene and its depth, before the 2D
+#endif
 
+#if COS_VISIONOS
+    if (!sVrRepaint) { // the picto box's steps happen on the game's ticks
+#endif
 #if TARGET_PC
     // The picto box (bug B36): GXCopyTex left the picture on the GPU; encode_s3tc reads it from RAM, so
     // step 3 waits one frame for the readback (pc_capture.cpp).
@@ -1943,14 +2099,24 @@ bool mDoGph_Painter() {
         }
     }
 
+#if COS_VISIONOS
+    }
+#endif
+
     if ((mCaptureStep == 3 || mCaptureStep == 4 || mCaptureStep == 5) && mCaptureDraw != 0
 #if VERSION > VERSION_DEMO
         && !mCaptureCansel
+#endif
+#if COS_VISIONOS
+        && !wwvr_vr_panels() // VR, and the Window's HUD layer: in the 2D's passes, below
 #endif
     ) {
         mDoGph_screenCaptureDraw();
     }
 
+#if COS_VISIONOS
+    if (!sVrRepaint) {
+#endif
 #if VERSION > VERSION_DEMO
     if (mCaptureStep == 5 && mCaptureCansel) {
         mCaptureStep = 6;
@@ -1973,6 +2139,19 @@ bool mDoGph_Painter() {
     }
 
     dDlst_list_c::calcWipe();
+#if COS_VISIONOS
+    }
+#endif
+#if COS_VISIONOS
+    // VR: the 2D twice, over black then over white, into the panel's passes (wwvr_vr.h); in the
+    // window on a frame with a 3D scene, the same into the window's HUD layer; otherwise once.
+    for (int vrPanel = wwvr_vr_panel_first(); vrPanel >= 0; vrPanel = wwvr_vr_panel_next(vrPanel)) {
+    wwvr_vr_panel_begin(vrPanel);
+    if (wwvr_vr_panels() && (mCaptureStep == 3 || mCaptureStep == 4 || mCaptureStep == 5) && mCaptureDraw != 0 &&
+        !mCaptureCansel) {
+        mDoGph_screenCaptureDraw();
+    }
+#endif
     j3dSys.reinitGX();
 #if VERSION > VERSION_JPN
     GXSetNumIndStages(0);
@@ -2016,8 +2195,22 @@ bool mDoGph_Painter() {
     if (!dMenu_flag())
         dComIfGp_particle_draw2Dfore(&jpaDrawInfo2D);
     dComIfGp_particle_draw2DmenuFore(&jpaDrawInfo2D);
+#if COS_VISIONOS
+    if (wwvr_window_enabled()) {
+        mDoGph_drawFaderAsIs(); // the window's scene fade, over the 2D (its HUD layer or the frame)
+    }
+    wwvr_vr_panel_end(vrPanel);
+    }
+#endif
 #if TARGET_PC
     pc_gph_mist_ab_show(); // COS_MIST_AB (pc_gpu_opts.h): the A/B frame's copies over everything
+#endif
+#if COS_VISIONOS
+    wwvr_window_after_hud(); // the finished frame, to the window
+    wwvr_vr_frame_finish();  // VR: the frame's last GPU task (the images' fences)
+    if (sVrRepaint) {
+        return true;
+    }
 #endif
 
     mDoGph_gInf_c::endRender();

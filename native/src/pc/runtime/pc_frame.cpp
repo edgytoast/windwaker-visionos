@@ -31,6 +31,10 @@
 // the same spin); no frame-usage statistics, interpolation, turbo mode or settings; a refused
 // aurora_begin_frame waits and retries instead of skipping the game frame.
 #include "pc_internal.h"
+
+#if defined(COS_VISIONOS)
+extern "C" void wwvr_frame_boundary(void);
+#endif
 #include "pc/pc_gpu_opts.h"
 #include "pc/pc_dynres.h"
 #include "pc/pc_hd_textures.h"
@@ -969,6 +973,9 @@ void pc_frame_pace(unsigned long long periodNs) {
 }
 
 void pc_frame_begin(void) {
+#if defined(COS_VISIONOS)
+    wwvr_frame_boundary(); // visionos/host/game_host.mm: drains the game thread's autorelease pool
+#endif
     if (sLoopStartNs == 0) {
         sLoopStartNs = monotonicNs();
         sLoopStartRetrace = VIGetRetraceCount();

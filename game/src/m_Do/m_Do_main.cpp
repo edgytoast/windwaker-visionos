@@ -27,6 +27,9 @@
 #include "m_Do/m_Do_machine.h"
 #include "m_Do/m_Do_printf.h"
 #include <stdio.h>
+#if COS_VISIONOS
+#include "wwvr_vr.h" // visionos/host
+#endif
 #if TARGET_PC
 #include "pc/pc_harness.h"
 #endif
@@ -538,6 +541,14 @@ void main01() {
 #if TARGET_PC
         // aurora_end_frame, the game frame count (stall watchdog, COS_FRAMES) and milestone M4.
         pc_frame_end();
+#endif
+#if COS_VISIONOS
+        wwvr_vr_frame_end(); // VR: the headset's frame ends once Aurora has submitted it
+        // VR: until the next tick, the same frame again for each display refresh, from the head's
+        // newest pose (the headset runs at 90 Hz, the game at 30).
+        while (wwvr_vr_repaint_due()) {
+            wwvr_vr_repaint();
+        }
 #endif
     } while (true);
 }

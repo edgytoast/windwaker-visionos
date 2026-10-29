@@ -1942,6 +1942,13 @@ int dDlst_peekZ_c::newData(s16 x, s16 y, u32* pDst) {
         return 0;
 
     dDlst_peekZ_entry *pEntry = &mEntries[mCount];
+#if COS_VISIONOS
+    // A place in the picture (mDoLib_project), peeked at the drawn frame's (wwvr_window.h).
+    f32 drawnX = x, drawnY = y;
+    mDoLib_pictureToDrawn(&drawnX, &drawnY);
+    x = (s16)drawnX;
+    y = (s16)drawnY;
+#endif
     pEntry->x = x;
     pEntry->y = y;
     pEntry->dst = pDst;
