@@ -208,3 +208,7 @@ Something else? [Report a problem](https://github.com/edgytoast/windwaker-vision
 [THIRD_PARTY.md](THIRD_PARTY.md) lists every component and its licence. *The Legend of Zelda: The
 Wind Waker* is Nintendo's. This project isn't affiliated with or endorsed by Nintendo, and none of
 the game's files are in the app or the repository.
+
+## Support
+
+This port brings The Legend of Zelda: The Wind Waker to Apple Vision Pro. It's listed on the [AVP Ports Index](https://github.com/edgytoast/avp-ports-index), which tracks every port we can find and runs a safety check on each one. If this guide got you playing, you can [buy me a coffee](https://buymeacoffee.com/adminpz) to help keep it running.
